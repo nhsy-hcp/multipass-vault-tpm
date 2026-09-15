@@ -24,9 +24,10 @@ vars:
   # here, never /tmp — it is gitignored and removed by `task clean:tmp`.
   TMP_DIR: .tmp
 
-  # In-VM staging for transferred scripts. Namespaced rather than bare /tmp so
-  # the lab cannot collide with anything else in the guest. This is the guest's
-  # own filesystem, so the host's .tmp/ has no meaning here.
+  # In-VM staging for transferred scripts. The guest's own /tmp is the right
+  # place for this — the host's .tmp/ convention keeps the Mac clean and does
+  # not extend into a throwaway VM. Namespaced rather than bare /tmp so the
+  # lab's files cannot collide with anything else in the guest.
   VM_STAGE: /tmp/tpm-lab
 
 tasks:

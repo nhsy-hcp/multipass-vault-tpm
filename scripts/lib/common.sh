@@ -18,13 +18,13 @@ export TPM_PORT ATTACKER_TPM_PORT
 
 # Scratch space.
 #
-# On the host, transient files belong in the project's own .tmp/ — never the
-# system temp directory. Inside the VM there is no project tree, so the guest's
-# own namespaced staging directory serves the same purpose. VM_STAGE is where
-# the Taskfile drops the scripts, and is the only place they should write
-# scratch files.
+# These scripts run inside the VM, where the guest's own /tmp is the right home
+# for staged scripts and scratch. (On the host side the project keeps its
+# scratch in a project-local .tmp/ instead, so the Mac stays clean.) VM_STAGE is
+# where the Taskfile drops the scripts and is the only place they should write
+# scratch files — namespaced so the lab cannot collide with anything else.
 VM_STAGE="${VM_STAGE:-/tmp/tpm-lab}"
-LAB_TMP="${LAB_TMP:-${VM_STAGE}/tmp}"
+LAB_TMP="${LAB_TMP:-${VM_STAGE}/scratch}"
 export VM_STAGE LAB_TMP
 
 # Point mktemp and anything else honouring TMPDIR at the lab's own scratch dir,

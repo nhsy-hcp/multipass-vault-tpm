@@ -137,6 +137,75 @@ as_lab_user vault write auth/cert/certs/tpm-devices \
 log_step "Verify: the cert auth role"
 as_lab_user vault read auth/cert/certs/tpm-devices
 
+log_step "Part 5.4: one-shot AppRole for enrolment"
+# Enrolment is the one moment a device has no certificate yet, so it cannot use
+# cert auth to get the credential that signs its first CSR. Something has to
+# bootstrap it. Handing over the dev root token would mean the device holds
+# unlimited privilege — delete every mount, mint any certificate, read every
+# secret — purely to obtain a certificate it is already entitled to.
+#
+# 'device-enrol' is the smallest credential that can do the job and nothing
+# else: one capability on one path. It cannot read secrets, cannot alter the
+# cert auth trust anchor, and cannot issue against any other PKI role.
+if mount_enabled auth "approle/"; then
+  log_detected "the approle auth method already enabled" "skipping enable"
+else
+  log_info "Enabling the approle auth method"
+  as_lab_user vault auth enable approle
+fi
+
+log_info "Writing the 'device-enrol' policy (sign CSRs only)"
+# Deliberately a single stanza. 'update' on pki/sign/devices is what signing a
+# CSR requires; anything beyond that would widen the blast radius of a leaked
+# SecretID for no benefit to the demo.
+as_lab_user vault policy write device-enrol - <<'EOF'
+path "pki/sign/devices" {
+  capabilities = ["update"]
+}
+EOF
+log_ok "policy device-enrol written"
+
+log_info "Creating the 'device-enrol' AppRole (single-use SecretID)"
+# 'vault write' is an upsert, so re-running this resets the role to the
+# intended shape rather than erroring — no guard needed.
+#
+# secret_id_num_uses=1 is the property on show: the credential is spent by the
+# first login and is worthless to anyone who copies it afterwards. Every later
+# authentication uses the TPM key and the certificate signed here, so this
+# credential is needed exactly once in a device's lifetime.
+#
+# token_num_uses=3 rather than 1 is deliberate. Signing the CSR is a single
+# request, but the enrolment script also looks the token up to narrate what it
+# was granted; a use-limit tripping mid-demo is a worse failure than a slightly
+# looser bound. The SecretID stays strictly single-use — that is the behaviour
+# being demonstrated, and the token is short-lived regardless.
+as_lab_user vault write auth/approle/role/device-enrol \
+  token_policies=device-enrol \
+  secret_id_num_uses=1 \
+  secret_id_ttl=10m \
+  token_ttl=5m \
+  token_max_ttl=10m \
+  token_num_uses=3
+
+log_step "Verify: the device-enrol AppRole"
+as_lab_user vault read auth/approle/role/device-enrol
+
+# The table above is long and the limits that matter are scattered through it,
+# so restate them as one line for the demo transcript.
+enrol_role_json="$(as_lab_user vault read -format=json auth/approle/role/device-enrol)"
+enrol_limits="$(printf '%s' "${enrol_role_json}" \
+  | jq -r '.data | "\(.secret_id_num_uses) \(.secret_id_ttl) \(.token_ttl) \(.token_max_ttl) \(.token_num_uses)"')"
+read -r sid_uses sid_ttl tok_ttl tok_max tok_uses <<<"${enrol_limits}"
+log_detail "SecretID: ${sid_uses} use(s), TTL ${sid_ttl}s"
+log_detail "Token:    TTL ${tok_ttl}s, max ${tok_max}s, ${tok_uses} uses"
+
+# The RoleID is the stable half of an AppRole credential and is not a secret —
+# it identifies the role, it does not authorise anything without a SecretID.
+# It is the part you would bake into an image, so showing it is useful.
+enrol_role_id="$(as_lab_user vault read -field=role_id auth/approle/role/device-enrol/role-id)"
+log_detail "RoleID:   ${enrol_role_id}"
+log_ok "AppRole device-enrol ready — SecretID is minted per enrolment, not here"
+
 # --- sentinel ---------------------------------------------------------------
 # Later scripts gate on this file: it records that Parts 4-5 completed against a
 # particular domain and CA, and survives nothing that Vault itself forgets.
@@ -154,6 +223,8 @@ jq -n \
      demo_device: $device,
      pki_role: "pki/roles/devices",
      cert_auth_role: "auth/cert/certs/tpm-devices",
+     approle_role: "auth/approle/role/device-enrol",
+     enrol_policy: "device-enrol",
      configured_at: $configured_at
    }' | write_lab_file "${SENTINEL}"
 

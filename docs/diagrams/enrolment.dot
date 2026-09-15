@@ -5,13 +5,14 @@
 digraph enrolment {
   rankdir=TB;
   bgcolor="white";
+  compound=true;
   splines=spline;
   nodesep=0.40;
   ranksep=0.50;
   fontname="Helvetica";
   fontsize=11;
   labelloc="t";
-  label="Enrolment and login — the private key never leaves the TPM";
+  label="Enrolment and login — the private key never leaves the TPM,\nand the device never holds the root token";
 
   node [
     shape=box,
@@ -57,23 +58,86 @@ digraph enrolment {
     color="#5f8a57"
   ];
 
-  // ------------------------------------------------------------ 3. Vault signs
-  s3 [
-    label="3.  vault write pki/sign/devices\nVault PKI issues node01.crt\nCN=node01.devices.lab.local",
+  // ------------------------------------------- 3. operator mints the credential
+  subgraph cluster_operator {
+    label="Operator  —  provisioning system, holds the root token";
+    labeljust="l";
+    fontsize=10;
+    style="rounded,filled";
+    fillcolor="#eef2f7";
+    color="#8fa0b5";
+    penwidth=1.2;
+
+    s3 [
+      label="3.  vault write -f -wrap-ttl=120s\nauth/approle/role/device-enrol/secret-id\nprivileged: update on .../secret-id",
+      fillcolor="#ece0f2",
+      color="#7d5b92"
+    ];
+
+    wrap [
+      label="wrapping token\nunwraps exactly once, 120s\ninterception is detectable,\nnot prevented",
+      shape=note,
+      style="filled",
+      fillcolor="#f7f0fa",
+      color="#7d5b92",
+      fontsize=9
+    ];
+
+    s3 -> wrap [color="#7d5b92"];
+  }
+
+  // -------------------------------------- 5-6. device redeems it, no root token
+  subgraph cluster_device {
+    label="Device  —  no root token, ever";
+    labeljust="l";
+    fontsize=10;
+    style="rounded,filled";
+    fillcolor="#fdf7ec";
+    color="#d9b678";
+    penwidth=1.2;
+
+    s5 [
+      label="5.  vault unwrap -field=secret_id\nSecretID: 1 use, ttl 10m",
+      fillcolor="#ece0f2",
+      color="#7d5b92"
+    ];
+
+    s6 [
+      label="6.  vault write auth/approle/login\nrole_id (public) + secret_id",
+      fillcolor="#ece0f2",
+      color="#7d5b92"
+    ];
+
+    tok [
+      label="device-enrol token\nexactly one capability:\nupdate on pki/sign/devices\nttl 5m / max 10m / 3 uses",
+      shape=note,
+      style="filled",
+      fillcolor="#f7f0fa",
+      color="#7d5b92",
+      fontsize=9
+    ];
+
+    s5 -> s6 [color="#7d5b92"];
+    s6 -> tok [color="#7d5b92"];
+  }
+
+  // ------------------------------------------------------------ 7. Vault signs
+  s7 [
+    label="7.  vault write pki/sign/devices\nVault PKI issues node01.crt\nCN=node01.devices.lab.local",
     fillcolor="#ece0f2",
     color="#7d5b92"
   ];
 
-  // -------------------------------------------------------------- 4. handshake
-  s4 [
-    label="4.  openssl s_client mTLS handshake\nTPM computes the CertificateVerify signature\nprivate key never crosses the TPM boundary",
+  // -------------------------------------------------------------- 8. handshake
+  s8 [
+    label="8.  openssl s_client mTLS handshake\nTPM computes the CertificateVerify signature\nprivate key never crosses the TPM boundary",
     fillcolor="#fdf0da",
     color="#b5883f"
   ];
 
-  // ------------------------------------------------------------- 5. validation
+  // ------------------------------------------------------------- 9. validation
   chk1 [
-    label="5a.  chains to the\ndevice CA?",
+    label="9a.  chains to the\ndevice CA?",
     shape=diamond,
     style="filled",
     fillcolor="#ece0f2",
@@ -83,7 +147,7 @@ digraph enrolment {
   ];
 
   chk2 [
-    label="5b.  CN matches\n*.devices.lab.local?",
+    label="9b.  CN matches\n*.devices.lab.local?",
     shape=diamond,
     style="filled",
     fillcolor="#ece0f2",
@@ -100,22 +164,22 @@ digraph enrolment {
     fontcolor="#6d3535"
   ];
 
-  // ------------------------------------------------------------------ 6. token
-  s6 [
-    label="6.  token issued\npolicies: default, device-read\nttl 15m / max 1h",
+  // ----------------------------------------------------------------- 10. token
+  s10 [
+    label="10.  token issued\npolicies: default, device-read\nttl 15m / max 1h",
     fillcolor="#ece0f2",
     color="#7d5b92"
   ];
 
-  // ------------------------------------------------------------------ 7. usage
-  s7read [
-    label="7a.  vault kv get\nsecret/devices/node01\n→ succeeds",
+  // ----------------------------------------------------------------- 11. usage
+  s11read [
+    label="11a.  vault kv get\nsecret/devices/node01\n→ succeeds",
     fillcolor="#dcedd9",
     color="#5f8a57"
   ];
 
-  s7write [
-    label="7b.  vault kv put\nsecret/devices/node01\n→ permission denied",
+  s11write [
+    label="11b.  vault kv put\nsecret/devices/node01\n→ permission denied",
     style="rounded,filled,dashed",
     fillcolor="#f8ecec",
     color="#a35b5b",
@@ -124,18 +188,31 @@ digraph enrolment {
 
   // ------------------------------------------------------------------- flow
   s1 -> s2  [label="TPM handle"];
-  s1 -> blob [label="only a wrapped blob", style=dotted, color="#5f8a57", fontcolor="#3f5f39"];
-  s2 -> s3  [label="node01.csr"];
-  s3 -> s4  [label="node01.crt"];
-  s4 -> chk1 [label="cert auth\nvalidates"];
+  s1 -> blob [label="only a wrapped\nblob", style=dotted, color="#5f8a57", fontcolor="#3f5f39"];
+
+  // the weak link: the wrapping token still has to reach the device somehow
+  wrap -> s5 [
+    lhead=cluster_device,
+    label="4.  delivery out of band\n— the weak link —\nsecure introduction,\nstill unsolved",
+    style=dashed,
+    penwidth=1.4,
+    color="#a35b5b",
+    fontcolor="#6d3535"
+  ];
+
+  s2  -> s7 [label="node01.csr"];
+  tok -> s7 [label="authorises step 7\nand nothing else", color="#7d5b92", fontcolor="#5b3f6c"];
+
+  s7 -> s8  [label="node01.crt"];
+  s8 -> chk1 [label="cert auth\nvalidates"];
   chk1 -> chk2 [label="yes"];
-  chk2 -> s6   [label="yes"];
+  chk2 -> s10  [label="yes"];
   chk1 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
   chk2 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
-  s6 -> s7read;
-  s6 -> s7write [style=dashed, color="#a35b5b"];
+  s10 -> s11read;
+  s10 -> s11write [style=dashed, color="#a35b5b"];
 
-  { rank=same; s1; blob; }
+  { rank=same; blob; s1; }
   { rank=same; chk2; deny; }
-  { rank=same; s7read; s7write; }
+  { rank=same; s11read; s11write; }
 }

@@ -79,9 +79,16 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 - **Script naming.** In-VM scripts are `scripts/NN_*.sh`, numbered in execution order.
   Host-only scripts live in `scripts/host/`. Shared helpers in `scripts/lib/common.sh`.
 - **How scripts reach the VM.** The internal `_run` task does
-  `multipass transfer` of `common.sh` and the script into `/tmp`, then
-  `multipass exec … sudo -E bash /tmp/NN_*.sh <args>`. Scripts therefore run as **root**
-  and source `/tmp/common.sh`, not a relative path.
+  `multipass transfer` of `common.sh` and every script into the guest staging
+  directory (`VM_STAGE`, currently `/tmp/tpm-lab`), then
+  `multipass exec … sudo -E bash $VM_STAGE/NN_*.sh <args>`. Scripts therefore run as
+  **root**, and each resolves its own location into `STAGE_DIR` and sources
+  `"${STAGE_DIR}/common.sh"` — never a hardcoded path, so the staging directory can move.
+  All scripts are transferred every time, because the Part 8 demos invoke `50_login.sh`
+  directly.
+
+  Temp files: the **host** uses the project-local `.tmp/` (never `/tmp`, never the
+  session scratchpad); inside the **VM**, `/tmp` is correct and `VM_STAGE` namespaces it.
 - **`as_lab_user` for everything.** Because scripts run as root, every `vault`, `openssl`
   and `tpm2_*` invocation goes through `as_lab_user`, which drops to the `ubuntu` user
   and sources `~/lab/env.sh` first. TPM key blobs must be created by the same user that
@@ -102,6 +109,19 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 - **Never "fix" the demo with a software key.** If the TPM path fails, diagnose the TPM
   path. Generating a plain EC key and pointing OpenSSL at it makes every command succeed
   and destroys the entire point of the lab.
+- **Device enrolment does not use the root token.** `task enrol` mints a
+  response-wrapped, one-shot AppRole SecretID as the *operator*
+  (`vault write -f -wrap-ttl=120s auth/approle/role/device-enrol/secret-id`), then
+  redeems it as the *device* (`vault unwrap` → `auth/approle/login` →
+  `pki/sign/devices`). The resulting `device-enrol` token carries exactly one
+  capability: `update` on `pki/sign/devices`. `task config` still uses root, and that is
+  correct — it is the operator provisioning trust, not a device authenticating.
+- **The operator/device split in `scripts/40_enrol_device.sh` is the point.** It is two
+  privilege domains in one script, deliberately. Do not "simplify" it by signing the CSR
+  with the root token, by skipping the wrap and passing the SecretID directly, or by
+  giving the `device-enrol` policy anything beyond its single capability. Each of those
+  makes the script shorter and deletes what it demonstrates. See
+  `docs/architecture.md` → Trust model.
 - **The attacker TPM is not a spare.** `swtpm@attacker` on :2331 exists solely so Part
   8.1 can present the device's key blob to a TPM with a different storage seed. It must
   keep its own state directory and must never share a seed with `swtpm@device`.

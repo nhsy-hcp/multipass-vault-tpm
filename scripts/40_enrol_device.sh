@@ -21,6 +21,22 @@ SENTINEL="${LAB_STATE_DIR}/config.json"
 
 TSS2_HEADER="-----BEGIN TSS2 PRIVATE KEY-----"
 
+# The enrolment credential, created by 'task config' (Part 5). The role is
+# deliberately tiny: secret_id_num_uses=1, secret_id_ttl=10m, token_ttl=5m,
+# token_num_uses=3, and a policy granting nothing but 'update' on
+# pki/sign/devices. See the commentary on 6.4 below for why.
+APPROLE="device-enrol"
+APPROLE_PATH="auth/approle/role/${APPROLE}"
+WRAP_TTL="120s"
+
+# auth/approle/login is an unauthenticated path, so Vault ignores whatever token
+# the CLI attaches to it — but leaving VAULT_TOKEN alone would put 'root' on the
+# wire during the very step that is meant to prove root is not involved, and an
+# empty value is worse: the CLI would fall back to the ~/.vault-token helper
+# file, which the dev server populates with the root token. A deliberate
+# placeholder keeps the demo honest.
+NO_TOKEN="device-holds-no-token"
+
 # Vault CLI output is captured as root, so ownership is applied on the way to
 # disk. Files openssl writes itself (-out) are already owned by the lab user.
 write_lab_file() {
@@ -100,20 +116,167 @@ as_lab_user openssl req -new \
 # the request with the key it holds.
 as_lab_user openssl req -in "${CSR}" -noout -verify -subject
 
-# --- 6.4 enrol: Vault signs the CSR -----------------------------------------
-log_step "6.4: enrol — have Vault's device CA sign the CSR"
+# --- 6.4 enrol: a one-shot AppRole credential, never the root token ----------
+#
+# Why this is not simply `vault write pki/sign/devices` with the dev root token:
+#
+#   * The device needs privilege exactly ONCE in its lifetime. From the moment
+#     the certificate below exists it authenticates with the TPM key and that
+#     certificate, forever (Part 7). Using root to obtain the first certificate
+#     would make bootstrap the weakest link in a chain whose entire claim is
+#     that the private key cannot be stolen.
+#   * So the operator mints a credential that is close to worthless to anyone
+#     else: an AppRole SecretID, single use, 10m TTL, whose token can do nothing
+#     but 'update' on pki/sign/devices — and it is delivered response-wrapped.
+#   * Response wrapping does not make the SecretID *secret* so much as make
+#     interception *detectable*. A wrapping token unwraps exactly once, so if
+#     anything read it in transit the device's own unwrap fails loudly, and the
+#     enrolment is known to be compromised rather than quietly cloned.
+#   * Be honest about what this does not fix: it shrinks the bootstrap secret,
+#     it does not remove it. Something still has to carry the wrapping token to
+#     the device — an image build, a provisioning agent, a technician. The gain
+#     is that what travels is single-use, short-lived, narrowly scoped and
+#     tamper-evident instead of unlimited and eternal.
+#
+# The flow is deliberately two-sided, and the output labels each side, because
+# the separation IS the point:
+#
+#   operator (root)  : mint the wrapped SecretID   <- privileged; done elsewhere
+#   device (no root) : unwrap -> login -> sign CSR <- all the device ever sees
+#
+# Mechanics: as_lab_user runs `bash -lc "source ${LAB_DIR}/env.sh; <cmd>"`, and
+# env.sh exports VAULT_TOKEN=root, so a device-side call cannot simply be given
+# a different token — the source would overwrite it. Each one therefore uses
+# `env VAULT_TOKEN=<token> vault ...`, which the shell executes *after* the
+# source has run, and an environment variable beats both the sourced value and
+# the ~/.vault-token helper file. Same idiom as scripts/60_privilege.sh.
+log_step "6.4: enrol — a one-shot, response-wrapped AppRole credential"
+
+# Vault's stderr is captured separately from its stdout throughout this step, so
+# a stray warning can never end up inside a captured JSON payload or token.
+ERR_LOG="$(mktemp)"
+trap 'rm -f "${ERR_LOG}"' EXIT
+
+# First non-blank line of the last Vault error, for one-line reporting.
+vault_error() { grep -m1 -v '^[[:space:]]*$' "${ERR_LOG}" || printf '(no error output)'; }
+
+# Secrets are only ever shown as a prefix — enough to correlate a value with
+# Vault's audit log, not enough to use. The certificate and role_id are not
+# secrets and are printed in full.
+redact() {
+  local v="${1:-}"
+  if (( ${#v} > 8 )); then printf '%s...' "${v:0:8}"; else printf '(%d chars)' "${#v}"; fi
+}
+
+# ---- operator side: uses the root token ------------------------------------
+log_step "6.4.1 (OPERATOR, root token): mint a response-wrapped SecretID"
+
+as_lab_user_allow_fail vault read "${APPROLE_PATH}" >/dev/null 2>&1 \
+  || die "no AppRole role at ${APPROLE_PATH} — run 'task config' first (it creates the '${APPROLE}' role and policy)"
+
+log_info "Minting a SecretID for '${APPROLE}', response-wrapped for ${WRAP_TTL}."
+log_detail "  vault write -f -wrap-ttl=${WRAP_TTL} ${APPROLE_PATH}/secret-id"
+log_detail "  Minting is itself a privileged operation — it needs 'update' on"
+log_detail "  ${APPROLE_PATH}/secret-id. In a real fleet a provisioning"
+log_detail "  system does this; the device never holds the credential that mints."
+
+rc=0
+wrap_json="$(as_lab_user_allow_fail vault write -f -format=json \
+  -wrap-ttl="${WRAP_TTL}" "${APPROLE_PATH}/secret-id" 2>"${ERR_LOG}")" || rc=$?
+(( rc == 0 )) \
+  || die "could not mint a wrapped SecretID (vault exit ${rc}): $(vault_error)"
+
+wrap_token="$(printf '%s' "${wrap_json}" | jq -r '.wrap_info.token // empty')" || wrap_token=''
+[[ -n "${wrap_token}" ]] \
+  || die "the mint response carried no .wrap_info.token — was -wrap-ttl honoured? Inspect: vault write -f -wrap-ttl=${WRAP_TTL} ${APPROLE_PATH}/secret-id"
+log_ok "wrapping token $(redact "${wrap_token}") — unwraps exactly once, expires in ${WRAP_TTL}"
+
+# role_id is the stable half of an AppRole: it names the role, it does not
+# authenticate, and it is not a secret. On a real fleet it is baked into the
+# device image at build time and handed over with the wrapping token, which is
+# why it is read here — operator-side — rather than by the device.
+rc=0
+role_id="$(as_lab_user_allow_fail vault read -field=role_id "${APPROLE_PATH}/role-id" 2>"${ERR_LOG}")" || rc=$?
+(( rc == 0 )) || die "could not read the role_id (vault exit ${rc}): $(vault_error)"
+[[ -n "${role_id}" ]] || die "${APPROLE_PATH}/role-id returned an empty role_id"
+log_detail "role_id ${role_id} (shown in full: bakeable, not a secret)"
+
+# ---- device side: must never see the root token -----------------------------
+log_step "6.4.2 (DEVICE, no root token): unwrap to obtain the SecretID"
+
+log_detail "  vault unwrap -field=secret_id <wrapping-token>"
+log_detail "  The wrapping token is the only credential the device holds. Unwrapping"
+log_detail "  needs no pre-existing token, and it succeeds exactly once."
+
+rc=0
+secret_id="$(as_lab_user_allow_fail env "VAULT_TOKEN=${wrap_token}" \
+  vault unwrap -field=secret_id "${wrap_token}" 2>"${ERR_LOG}")" || rc=$?
+if (( rc != 0 )); then
+  log_error "$(vault_error)"
+  die "unwrap failed (vault exit ${rc}) — a wrapping token unwraps ONCE. Either it expired (${WRAP_TTL}) or something unwrapped it first, which is precisely the interception this design exists to expose."
+fi
+[[ -n "${secret_id}" ]] || die "unwrap returned an empty secret_id"
+log_ok "SecretID $(redact "${secret_id}") — single use, 10m TTL, now consumed from the wrapper"
+
+log_step "6.4.3 (DEVICE, no root token): log in with role_id + SecretID"
+log_detail "  vault write -field=token auth/approle/login role_id=<role> secret_id=<secret>"
+
+rc=0
+enrol_token="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
+  vault write -field=token auth/approle/login \
+  role_id="${role_id}" secret_id="${secret_id}" 2>"${ERR_LOG}")" || rc=$?
+(( rc == 0 )) \
+  || die "AppRole login failed (vault exit ${rc}): $(vault_error) — a SecretID is single use, so re-run 'task enrol' to mint a fresh one rather than retrying with this value"
+[[ -n "${enrol_token}" ]] || die "auth/approle/login returned no token"
+log_ok "enrol token $(redact "${enrol_token}") — policy ${APPROLE}, ttl 5m, 3 uses"
+
+log_step "6.4.4 (DEVICE, no root token): have the device CA sign the CSR"
 # Always re-sign: certificates are short-lived (24h) and re-running 'task enrol'
-# is the intended way to refresh an expired device certificate.
-as_lab_user vault write -format=json pki/sign/devices \
+# is the intended way to refresh an expired device certificate. Each run mints a
+# fresh SecretID because the previous one was spent on the login above — nothing
+# here is cached or reused between runs.
+log_info "Signing ${CSR} — the only operation this token is permitted."
+log_detail "  VAULT_TOKEN=<enrol> vault write pki/sign/devices csr=@${CSR} ttl=24h"
+
+rc=0
+sign_json="$(as_lab_user_allow_fail env "VAULT_TOKEN=${enrol_token}" \
+  vault write -format=json pki/sign/devices \
   csr=@"${CSR}" \
   common_name="${CN}" \
-  ttl=24h | write_lab_file "${SIGN_JSON}"
+  ttl=24h 2>"${ERR_LOG}")" || rc=$?
+(( rc == 0 )) \
+  || die "the enrol token could not sign the CSR (vault exit ${rc}): $(vault_error)"
 
+printf '%s\n' "${sign_json}" | write_lab_file "${SIGN_JSON}"
 jq -r '.data.certificate'   "${SIGN_JSON}" | write_lab_file "${CRT}"
 jq -r '.data.serial_number' "${SIGN_JSON}" | write_lab_file "${SERIAL}"
 
 [[ -s "${CRT}" ]] || die "no certificate in ${SIGN_JSON}"
 log_ok "certificate issued: ${CRT} (serial $(cat "${SERIAL}"))"
+
+# ---- the scope of that token, demonstrated ----------------------------------
+# Failure is the expected outcome here, so the call tolerates it and the script
+# reports rather than aborts: an unexpected success is the interesting result,
+# not a reason to stop the enrolment that has already succeeded.
+log_step "6.4.5 (DEVICE, no root token): what the enrol token cannot do"
+log_info "Reading the device's own secret with the enrol token — outside its policy."
+log_detail "  VAULT_TOKEN=<enrol> vault kv get secret/devices/${DEVICE}"
+
+rc=0
+deny_out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${enrol_token}" \
+  vault kv get "secret/devices/${DEVICE}" 2>&1)" || rc=$?
+if (( rc != 0 )); then
+  if printf '%s' "${deny_out}" | grep -qiE 'permission denied|Code: 403'; then
+    report_expect "permission denied (403)" "permission denied (vault exit ${rc})"
+  else
+    report_expect "permission denied (403)" \
+                  "denied, but differently: $(printf '%s\n' "${deny_out}" | grep -m1 -v '^[[:space:]]*$' || printf '(no output)')"
+  fi
+  log_detail "The device reads that secret in Part 7 — with the token it earns from the TPM key, not this one."
+else
+  report_expect "permission denied (403)" "READ SUCCEEDED — the ${APPROLE} policy grants more than pki/sign/devices"
+  log_warn "check 'vault policy read ${APPROLE}': enrolment should not imply read access"
+fi
 
 # --- verify ------------------------------------------------------------------
 log_step "Verify: the issued device certificate"
