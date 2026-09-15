@@ -1,0 +1,278 @@
+---
+version: '3'
+
+vars:
+  # VM
+  NAME: tpm-lab
+  UBUNTU: "24.04"
+  CPUS: "2"
+  MEMORY: 4G
+  DISK: 20G
+
+  # Lab identity
+  DEVICE_NAME: node01
+  DOMAIN: devices.lab.local
+
+  # Software TPMs: the device TPM, and a second one standing in for a
+  # different machine during the Part 8.1 stolen-key demo.
+  TPM_PORT: "2321"
+  ATTACKER_TPM_PORT: "2331"
+
+  LAB_DIR: /home/ubuntu/lab
+
+  # Host-side scratch. Everything transient this project writes on the Mac goes
+  # here, never /tmp — it is gitignored and removed by `task clean:tmp`.
+  TMP_DIR: .tmp
+
+  # In-VM staging for transferred scripts. Namespaced rather than bare /tmp so
+  # the lab cannot collide with anything else in the guest. This is the guest's
+  # own filesystem, so the host's .tmp/ has no meaning here.
+  VM_STAGE: /tmp/tpm-lab
+
+tasks:
+  default:
+    cmd: task --list
+
+  # ==========================================================================
+  # Host
+  # ==========================================================================
+  deps:
+    desc: Check host dependencies (multipass, task, jq, graphviz)
+    cmd: ./scripts/host/deps.sh
+
+  init:
+    desc: One-time project setup — install pre-commit hooks
+    cmds:
+      - mkdir -p {{.TMP_DIR}}
+      - pre-commit install
+      - cmd: test -f .env || cp .env.template .env
+        ignore_error: true
+      - echo "Project initialised. Next- task deps, then task lab"
+    silent: true
+
+  clean:tmp:
+    desc: Remove host-side scratch files
+    cmd: rm -rf {{.TMP_DIR}}
+
+  # ==========================================================================
+  # VM lifecycle
+  # ==========================================================================
+  launch:
+    desc: Launch the Multipass VM (no-op if it already exists)
+    # Fail fast on a missing host tool rather than deep inside a provisioning
+    # script. `lab` reaches the VM only through here, so one gate covers both.
+    deps: [deps]
+    status:
+      - multipass info {{.NAME}} >/dev/null 2>&1
+    cmds:
+      - echo "Launching {{.NAME}} — Ubuntu {{.UBUNTU}}, {{.CPUS}} cpus, {{.MEMORY}} memory, {{.DISK}} disk"
+      - multipass launch {{.UBUNTU}} --name {{.NAME}} --cpus {{.CPUS}} --memory {{.MEMORY}} --disk {{.DISK}}
+      - multipass info {{.NAME}}
+
+  start:
+    aliases: [up]
+    desc: Start a stopped VM
+    cmd: multipass start {{.NAME}}
+
+  stop:
+    aliases: [down]
+    desc: Stop the VM, keeping all lab state on disk
+    cmd: multipass stop {{.NAME}}
+
+  shell:
+    desc: Open an interactive shell in the VM
+    cmd: multipass shell {{.NAME}}
+
+  clean:
+    desc: Delete and purge the VM entirely
+    cmds:
+      - multipass stop {{.NAME}}
+      - multipass delete --purge {{.NAME}}
+    ignore_error: true
+
+  rebuild:
+    desc: Destroy everything and rebuild the lab from scratch
+    cmds:
+      - task: clean
+      - task: lab
+
+  # ==========================================================================
+  # Logs
+  # ==========================================================================
+  logs:tpm:
+    desc: Follow the device swtpm journal
+    cmd: multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -f
+
+  logs:vault:
+    desc: Follow the Vault dev server journal
+    cmd: multipass exec {{.NAME}} -- sudo journalctl -u vault-dev -f
+
+  logs:
+    desc: Show recent logs from both lab services
+    cmds:
+      - multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -u swtpm@attacker -u vault-dev --no-pager -n 50
+
+  # ==========================================================================
+  # Lab build — each step is idempotent and individually re-runnable
+  # ==========================================================================
+  lab:
+    desc: Build the whole lab (provision, tpm, vault, config, enrol)
+    cmds:
+      - task: launch
+      - task: provision
+      - task: tpm
+      - task: vault
+      - task: config
+      - task: enrol
+      - echo ""
+      - echo "Lab ready. Run 'task demo' for the full walkthrough."
+
+  provision:
+    desc: 'Part 1: install TPM tooling and Vault in the VM'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 00_provision.sh}
+
+  tpm:
+    desc: 'Part 2: start the software TPMs as systemd units'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 10_tpm_unit.sh, ARGS: '{{.TPM_PORT}} {{.ATTACKER_TPM_PORT}}'}
+
+  vault:
+    desc: 'Part 3: start the Vault dev server (TLS) as a systemd unit'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 20_vault_unit.sh}
+
+  config:
+    desc: 'Parts 4-5: configure PKI device CA, KV secret, policy and cert auth'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}}'}
+
+  enrol:
+    desc: 'Part 6: create the device key inside the TPM and enrol it with Vault'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 40_enrol_device.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
+
+  # ==========================================================================
+  # Demo
+  # ==========================================================================
+  demo:
+    desc: Run the full narrated demonstration (Parts 6-8)
+    cmds:
+      - task: demo:nonexportable
+      - task: demo:login
+      - task: demo:privilege
+      - task: demo:negative
+
+  demo:login:
+    desc: 'Part 7: authenticate to Vault using the TPM-held key'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 50_login.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  demo:privilege:
+    desc: 'Part 7.3: device token can read its secret but not write it'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 60_privilege.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  demo:nonexportable:
+    desc: Show the key file on disk is a TPM-wrapped blob, not a private key
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 45_nonexportable.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  demo:negative:
+    desc: 'Part 8: every negative test, in order'
+    cmds:
+      - task: demo:negative:stolen-key
+      - task: demo:negative:no-cert
+      - task: demo:negative:untrusted-ca
+      - task: demo:negative:wrong-cn
+      - task: demo:negative:revoked-token
+
+  demo:negative:stolen-key:
+    desc: '8.1: the key blob is useless against a different TPM'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 70_negative_stolen_key.sh, ARGS: '{{.DEVICE_NAME}} {{.ATTACKER_TPM_PORT}}'}
+
+  demo:negative:no-cert:
+    desc: '8.2: login without a client certificate is rejected'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 71_negative_no_cert.sh}
+
+  demo:negative:untrusted-ca:
+    desc: '8.3: a TPM key alone is not enough — the cert must chain to the device CA'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 72_negative_untrusted_ca.sh, ARGS: '{{.DOMAIN}}'}
+
+  demo:negative:wrong-cn:
+    desc: '8.4: a trusted-CA cert with the wrong common name is rejected'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 73_negative_wrong_cn.sh}
+
+  demo:negative:revoked-token:
+    desc: '8.5: a revoked device token can no longer read'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 74_negative_revoked_token.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  # ==========================================================================
+  # Maintenance
+  # ==========================================================================
+  reset:
+    desc: Wipe lab state inside the VM but keep the VM itself
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 90_reset.sh}
+      - echo "Lab state cleared. Rebuild with- task tpm vault config enrol"
+
+  lint:
+    desc: Run pre-commit hooks (shellcheck, gitleaks) on all files
+    cmd: pre-commit run --all-files
+
+  docs:diagram:
+    desc: Render the architecture diagrams from Graphviz sources to PNG
+    cmds:
+      - |
+        if ! command -v dot >/dev/null 2>&1; then
+          echo "graphviz not found. Install it with: brew install graphviz" >&2
+          exit 1
+        fi
+      - for: [topology, enrolment]
+        cmd: dot -Tpng -Gdpi=144 -o docs/diagrams/{{.ITEM}}.png docs/diagrams/{{.ITEM}}.dot
+      - echo "Rendered docs/diagrams/topology.png and docs/diagrams/enrolment.png"
+    sources:
+      - docs/diagrams/*.dot
+    generates:
+      - docs/diagrams/*.png
+
+  # ==========================================================================
+  # Internal: sync scripts into the VM and run one
+  # ==========================================================================
+  # All scripts are transferred every time, not just the one being run: the
+  # Part 8 negative demos invoke 50_login.sh directly, so the whole set has to
+  # be present. Transfers are local and cheap, and this keeps the VM copy from
+  # drifting behind the working tree mid-demo.
+  _sync:
+    internal: true
+    cmds:
+      - multipass exec {{.NAME}} -- mkdir -p {{.VM_STAGE}}
+      - multipass transfer ./scripts/lib/common.sh {{.NAME}}:{{.VM_STAGE}}/common.sh
+      - multipass transfer ./scripts/*.sh {{.NAME}}:{{.VM_STAGE}}/
+
+  _run:
+    internal: true
+    requires:
+      vars: [SCRIPT]
+    cmds:
+      - task: _sync
+      - multipass exec {{.NAME}} -- sudo -E bash {{.VM_STAGE}}/{{.SCRIPT}} {{.ARGS}}

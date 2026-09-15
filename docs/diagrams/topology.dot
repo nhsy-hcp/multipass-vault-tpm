@@ -1,0 +1,121 @@
+// Vault TPM-backed cert auth lab — component topology.
+// Render: dot -Tpng -Gdpi=144 -o topology.png topology.dot
+// or: task docs:diagram
+
+digraph topology {
+  rankdir=LR;
+  bgcolor="white";
+  compound=true;
+  splines=spline;
+  nodesep=0.35;
+  ranksep=0.85;
+  fontname="Helvetica";
+  fontsize=11;
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=10,
+    color="#4a5568",
+    fillcolor="#f7fafc",
+    fontcolor="#1a202c",
+    penwidth=1.1,
+    margin="0.18,0.10"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=9,
+    color="#4a5568",
+    fontcolor="#2d3748",
+    penwidth=1.0,
+    arrowsize=0.7
+  ];
+
+  // ---------------------------------------------------------------- macOS host
+  subgraph cluster_host {
+    label="macOS host";
+    labeljust="l";
+    fontsize=11;
+    style="rounded,filled";
+    fillcolor="#eef2f7";
+    color="#8fa0b5";
+    penwidth=1.2;
+
+    term  [label="Terminal\nTaskfile.yml"];
+    mpcli [label="Multipass CLI"];
+
+    term -> mpcli [label="task …"];
+  }
+
+  // ------------------------------------------------------------------- the VM
+  subgraph cluster_vm {
+    label="Ubuntu 24.04 arm64 VM  (tpm-lab)";
+    labeljust="l";
+    fontsize=11;
+    style="rounded,filled";
+    fillcolor="#e8f0f8";
+    color="#7f9bb8";
+    penwidth=1.2;
+
+    tpm [
+      label="swtpm@device\nsoftware TPM 2.0\ntcp :2321",
+      fillcolor="#dcedd9",
+      color="#5f8a57"
+    ];
+
+    attacker [
+      label="swtpm@attacker\ntcp :2331\ndifferent storage seed\n(Part 8.1 only)",
+      style="rounded,filled,dashed",
+      fillcolor="#f2f2f0",
+      color="#9a9a94",
+      fontcolor="#5a5a54"
+    ];
+
+    client [
+      label="Device client\nopenssl + tpm2 provider\nnode01.devices.lab.local",
+      fillcolor="#fdf0da",
+      color="#b5883f"
+    ];
+
+    // ------------------------------------------------------------ Vault itself
+    subgraph cluster_vault {
+      label="vault-dev  —  https://127.0.0.1:8200  (dev, in-memory)";
+      labeljust="l";
+      fontsize=10;
+      style="rounded,filled";
+      fillcolor="#f4eaf6";
+      color="#9e7fae";
+      penwidth=1.2;
+
+      pki  [label="PKI engine\ndevice CA\nrole: devices",   fillcolor="#ece0f2", color="#7d5b92"];
+      cert [label="cert auth method\nrole: tpm-devices",     fillcolor="#ece0f2", color="#7d5b92"];
+      kv   [label="KV v2\nsecret/devices/node01",            fillcolor="#ece0f2", color="#7d5b92"];
+    }
+  }
+
+  // ---------------------------------------------------------------- host -> VM
+  mpcli -> client [
+    lhead=cluster_vm,
+    label="multipass transfer / exec",
+    style=dashed,
+    color="#6b7280"
+  ];
+
+  // ----------------------------------------------------------------- lab flows
+  client -> tpm  [label="sign with\nnon-exportable key", color="#5f8a57", fontcolor="#3f5f39"];
+  pki    -> client [label="1. signs CSR →\ndevice certificate", color="#7d5b92", fontcolor="#5b3f6c"];
+  client -> cert   [label="2. mTLS login\n(client cert + TPM signature)", color="#b5883f", fontcolor="#7d5c22"];
+  cert   -> pki    [label="trusts device CA", style=dotted, constraint=false, color="#7d5b92", fontcolor="#5b3f6c"];
+  cert   -> client [label="3. token, policy device-read", color="#7d5b92", fontcolor="#5b3f6c"];
+  client -> kv     [label="4. read (write denied)", color="#b5883f", fontcolor="#7d5c22"];
+
+  client -> attacker [
+    label="Part 8.1: same key blob,\ndifferent TPM → handshake fails",
+    style=dashed,
+    color="#9a9a94",
+    fontcolor="#5a5a54",
+    constraint=false
+  ];
+}

@@ -1,0 +1,50 @@
+#!/bin/bash
+# Host dependency check. Runs on macOS, never inside the VM.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# Host scratch lives in the project, per the project convention. Create it here
+# so anything running later can rely on it existing.
+export LAB_TMP="${PROJECT_ROOT}/.tmp"
+# shellcheck source=../lib/common.sh
+source "${SCRIPT_DIR}/../lib/common.sh"
+
+log_step "Host dependencies"
+
+missing=0
+required=(multipass task jq git)
+optional=(shellcheck gitleaks pre-commit dot)
+
+for c in "${required[@]}"; do
+  if command -v "$c" >/dev/null 2>&1; then
+    log_ok "$c"
+  else
+    log_error "$c is required but not installed"
+    missing=1
+  fi
+done
+
+for c in "${optional[@]}"; do
+  if command -v "$c" >/dev/null 2>&1; then
+    log_ok "$c"
+  else
+    case "$c" in
+      dot)  log_warn "graphviz not installed — 'task docs:diagram' will fail. Install: brew install graphviz" ;;
+      *)    log_warn "$c not installed — 'task lint' will fail. Install: brew install $c" ;;
+    esac
+  fi
+done
+
+if (( missing )); then
+  die "install the missing required tools and re-run 'task deps'"
+fi
+
+log_step "Multipass"
+multipass version | sed 's/^/  /'
+
+log_info ''
+log_detail "Apple Silicon hosts create arm64 guests; the HashiCorp apt repo and"
+log_detail "Ubuntu TPM packages both publish arm64 builds, so no changes are needed."
+
+log_ok "host is ready — next: task lab"

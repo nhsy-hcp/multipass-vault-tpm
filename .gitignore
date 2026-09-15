@@ -1,0 +1,33 @@
+# plans and scratch
+.plans/
+.tmp/
+
+# go-task checksum cache
+.task/
+
+# environment
+.env
+
+# claude local settings
+.claude/settings.local.json
+
+# certificates, keys and lab artefacts
+*.pem
+*.crt
+*.csr
+*.key
+*.serial
+*.tpmkey
+
+# logs
+logs/
+*.log
+
+# ide
+.idea/
+.vscode/
+*.iml
+
+# os
+.DS_Store
+Thumbs.db

@@ -1,0 +1,141 @@
+// Vault TPM-backed cert auth lab — enrolment and login trust flow.
+// Render: dot -Tpng -Gdpi=144 -o enrolment.png enrolment.dot
+// or: task docs:diagram
+
+digraph enrolment {
+  rankdir=TB;
+  bgcolor="white";
+  splines=spline;
+  nodesep=0.40;
+  ranksep=0.50;
+  fontname="Helvetica";
+  fontsize=11;
+  labelloc="t";
+  label="Enrolment and login — the private key never leaves the TPM";
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=10,
+    color="#4a5568",
+    fillcolor="#f7fafc",
+    fontcolor="#1a202c",
+    penwidth=1.1,
+    margin="0.20,0.11"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=9,
+    color="#4a5568",
+    fontcolor="#2d3748",
+    penwidth=1.0,
+    arrowsize=0.7
+  ];
+
+  // --------------------------------------------------------- 1. key generation
+  s1 [
+    label="1.  openssl genpkey -provider tpm2\nkey pair created INSIDE the TPM",
+    fillcolor="#dcedd9",
+    color="#5f8a57"
+  ];
+
+  blob [
+    label="on disk: node01.tpmkey.pem\n-----BEGIN TSS2 PRIVATE KEY-----\nwrapped to the TPM storage root key\n— not a usable private key",
+    shape=note,
+    style="filled",
+    fillcolor="#f3f8f2",
+    color="#5f8a57",
+    fontsize=9
+  ];
+
+  // ------------------------------------------------------------------- 2. CSR
+  s2 [
+    label="2.  openssl req -new\nCSR signature computed by the TPM\nproves possession without export",
+    fillcolor="#dcedd9",
+    color="#5f8a57"
+  ];
+
+  // ------------------------------------------------------------ 3. Vault signs
+  s3 [
+    label="3.  vault write pki/sign/devices\nVault PKI issues node01.crt\nCN=node01.devices.lab.local",
+    fillcolor="#ece0f2",
+    color="#7d5b92"
+  ];
+
+  // -------------------------------------------------------------- 4. handshake
+  s4 [
+    label="4.  openssl s_client mTLS handshake\nTPM computes the CertificateVerify signature\nprivate key never crosses the TPM boundary",
+    fillcolor="#fdf0da",
+    color="#b5883f"
+  ];
+
+  // ------------------------------------------------------------- 5. validation
+  chk1 [
+    label="5a.  chains to the\ndevice CA?",
+    shape=diamond,
+    style="filled",
+    fillcolor="#ece0f2",
+    color="#7d5b92",
+    fontsize=9,
+    margin="0.05,0.02"
+  ];
+
+  chk2 [
+    label="5b.  CN matches\n*.devices.lab.local?",
+    shape=diamond,
+    style="filled",
+    fillcolor="#ece0f2",
+    color="#7d5b92",
+    fontsize=9,
+    margin="0.05,0.02"
+  ];
+
+  deny [
+    label="login refused\nno token issued\n(Parts 8.2 – 8.4)",
+    style="rounded,filled,dashed",
+    fillcolor="#f8ecec",
+    color="#a35b5b",
+    fontcolor="#6d3535"
+  ];
+
+  // ------------------------------------------------------------------ 6. token
+  s6 [
+    label="6.  token issued\npolicies: default, device-read\nttl 15m / max 1h",
+    fillcolor="#ece0f2",
+    color="#7d5b92"
+  ];
+
+  // ------------------------------------------------------------------ 7. usage
+  s7read [
+    label="7a.  vault kv get\nsecret/devices/node01\n→ succeeds",
+    fillcolor="#dcedd9",
+    color="#5f8a57"
+  ];
+
+  s7write [
+    label="7b.  vault kv put\nsecret/devices/node01\n→ permission denied",
+    style="rounded,filled,dashed",
+    fillcolor="#f8ecec",
+    color="#a35b5b",
+    fontcolor="#6d3535"
+  ];
+
+  // ------------------------------------------------------------------- flow
+  s1 -> s2  [label="TPM handle"];
+  s1 -> blob [label="only a wrapped blob", style=dotted, color="#5f8a57", fontcolor="#3f5f39"];
+  s2 -> s3  [label="node01.csr"];
+  s3 -> s4  [label="node01.crt"];
+  s4 -> chk1 [label="cert auth\nvalidates"];
+  chk1 -> chk2 [label="yes"];
+  chk2 -> s6   [label="yes"];
+  chk1 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
+  chk2 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
+  s6 -> s7read;
+  s6 -> s7write [style=dashed, color="#a35b5b"];
+
+  { rank=same; s1; blob; }
+  { rank=same; chk2; deny; }
+  { rank=same; s7read; s7write; }
+}
