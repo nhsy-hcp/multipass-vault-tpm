@@ -65,19 +65,28 @@ The trust chain, step by step:
 2. **The CSR is signed by the TPM.** `openssl req -new` produces a CSR whose signature
    was computed inside the TPM. That signature is the proof of possession, and it never
    required the key to leave.
-3. **The operator mints a wrapped SecretID.** Holding the root token,
+3. **The orchestrator mints a wrapped SecretID.** Holding an `enrol-orchestrator`
+   token — *not* the root token —
    `vault write -f -wrap-ttl=120s auth/approle/role/device-enrol/secret-id` returns a
    *response-wrapping* token rather than the SecretID itself. Minting is a privileged
-   act — it needs `update` on `auth/approle/role/device-enrol/secret-id` — and in
-   reality belongs to a provisioning system, not to the device.
+   act: it needs `update` on `auth/approle/role/device-enrol/secret-id`, and that
+   capability plus `read` on the RoleID path is the orchestrator's entire privilege. It
+   cannot sign a CSR, read a secret, or inspect the role it mints for. This is the
+   provisioning system's job, not the device's.
+
+   Wrapping normally costs no extra permission — Vault authorises the call against the
+   target path as usual and wraps the reply afterwards. The `enrol-orchestrator` policy
+   sets `min_wrapping_ttl` on that path, which inverts it: an *unwrapped* mint is denied.
+   Tamper-evidence is enforced rather than merely conventional.
 4. **The wrapping token is delivered to the device.** This is the one step Vault cannot
    help with, and it is where the remaining trust sits. See
    [Bootstrapping the first certificate](#bootstrapping-the-first-certificate).
 5. **The device unwraps it.** `vault unwrap -field=secret_id <wrapping-token>` yields
    the SecretID. The wrapping token unwraps exactly once; the SecretID itself is good
    for one use and ten minutes.
-6. **The device logs in to AppRole.** It reads the public `role_id` from
-   `auth/approle/role/device-enrol/role-id`, then
+6. **The device logs in to AppRole.** It receives the public `role_id` alongside the
+   wrapping token — the orchestrator read it in step 3, because at this moment the
+   device holds no token of its own — then
    `vault write auth/approle/login role_id=… secret_id=…`. Back comes a `device-enrol`
    token: `token_ttl=5m`, `token_max_ttl=10m`, `token_num_uses=3`, and exactly one
    capability — `update` on `pki/sign/devices`.
@@ -111,7 +120,7 @@ instead load the key as a `crypto.Signer` and build a `tls.Certificate` in code.
 | Party | What it actually trusts / guarantees |
 |---|---|
 | Vault cert auth | Only the **device CA certificate**. Any certificate chaining to it, with a matching common name, is a valid device |
-| Vault PKI | Whoever holds a token permitted to write `pki/sign/devices`. That is now a `device-enrol` AppRole token with that one capability and nothing else — but whoever can mint its SecretID can still obtain a device certificate |
+| Vault PKI | Whoever holds a token permitted to write `pki/sign/devices`. That is now a `device-enrol` AppRole token with that one capability and nothing else — and the right to mint its SecretID is itself confined to the `enrol-orchestrator` policy, so "whoever can mint" is now a named, auditable identity rather than root |
 | The TPM | That the private key cannot be extracted, and that every signature was produced by that specific TPM |
 | The certificate | Binds a name to a public key. It says nothing about *where* the key lives — that fact is established only at enrolment time |
 
@@ -150,6 +159,7 @@ instead. That is a genuine improvement, and worth being precise about what it bu
 | Unlimited uses, unlimited scope | SecretID good for one use and 10 minutes; the token for 5 minutes and 3 uses |
 | Could read every secret, rewrite cert auth trust, issue for any PKI role | Can do none of those — only sign a CSR against the `devices` role |
 | Compromise is total and silent | Compromise is bounded, and a replay of the wrapping token fails visibly |
+| The *minting* side held the root token | The minting side holds an `enrol-orchestrator` token: `update` on one SecretID path, `read` on one RoleID path. Compromising the provisioning system yields device certificates, not the whole Vault |
 
 The credential is needed exactly once per device lifetime. After enrolment every login
 uses the TPM key and the certificate, so nothing standing is left behind on the device.
@@ -172,33 +182,46 @@ Three limits, stated plainly:
   `swtpm` has no manufacturer endorsement key certificate to chain to, so there is
   nothing to verify against.
 
-### Operator and device
+### Operator, orchestrator and device
 
-The split is the teaching point, so it is worth naming which side holds what:
+The split is the teaching point, so it is worth naming which side holds what. There are
+three privilege domains, not two:
 
-| | Operator / provisioning system | Device |
-|---|---|---|
-| Token held | Root (in the lab); a scoped enrolment admin in production | Only the `device-enrol` token it obtained itself |
-| Privilege | `update` on `auth/approle/role/device-enrol/secret-id` — can mint enrolment credentials for any device | `update` on `pki/sign/devices` — can sign a CSR against the `devices` role and nothing else |
-| Sees the SecretID? | No. It only ever handles the wrapping token | Yes, once, via `vault unwrap` |
-| When | Once per device, at provisioning time | Once per device, at first boot |
+| | Operator | Orchestrator / provisioning system | Device |
+|---|---|---|---|
+| Token held | Root | `enrol-orchestrator`, minted by the operator, 24h | Only the `device-enrol` token it obtained itself |
+| Privilege | Configure trust: mounts, policies, auth methods, the CA | `update` on `auth/approle/role/device-enrol/secret-id`, `read` on `.../role-id` — can mint enrolment credentials for any device, and nothing else | `update` on `pki/sign/devices` — can sign a CSR against the `devices` role and nothing else |
+| Sees the SecretID? | n/a — it is not involved in enrolment | No. It only ever handles the wrapping token | Yes, once, via `vault unwrap` |
+| When | Once, at lab build (`task config`) | Once per device, at provisioning time (`task enrol`, 6.4.1) | Once per device, at first boot (`task enrol`, 6.4.2–6.4.4) |
 
-Minting a SecretID is itself a privileged operation. Moving it to the operator side does
-not make it free — it concentrates it somewhere that can be audited, rate-limited and
-kept off the device.
+Minting a SecretID is itself a privileged operation. Moving it off the device does not
+make it free — it concentrates it somewhere that can be audited, rate-limited and kept
+off the device. Giving that act its own scoped identity, rather than performing it with
+root, is what stops "the provisioning system is compromised" from meaning "Vault is
+compromised": an attacker holding the orchestrator token can obtain device certificates,
+which is bad, but cannot read a secret, rewrite the cert auth trust anchor, or mint
+itself anything stronger.
+
+Be honest about the recursion, though: root created the orchestrator's token, so root
+remains the ultimate authority in this lab. The claim is not that root vanished — it is
+that root is not on the wire when a device enrols, and the privilege that *is* present
+there is bounded, named and auditable.
 
 Note what did **not** change: `task config` still runs as root. That is correct. It is
 the operator establishing trust — creating the device CA, the issuing role, the policies,
-the cert auth role and the AppRole itself. Configuring Vault is a root-shaped job. A
-device authenticating to Vault is not, and that is the step that moved.
+the cert auth role, the AppRole, and the orchestrator's own credential. Issuing the
+orchestrator its token belongs there for the same reason: handing out privilege is the
+operator's job, exercising it is not. Configuring Vault is a root-shaped job. A device
+authenticating to Vault is not, and neither is minting its bootstrap credential — those
+are the two steps that moved.
 
 ## What each part proves
 
 | Lab part | Task | What to conclude |
 |---|---|---|
 | 1–3 | `task provision`, `task tpm`, `task vault` | The environment is reproducible: TPM and Vault both come up as managed systemd units |
-| 4–5 | `task config` | Trust is configured explicitly — a device CA, one issuing role, the `device-read` and `device-enrol` policies, the `device-enrol` AppRole, one cert auth role. The one step that legitimately uses the root token |
-| 6 | `task enrol` | The device identity is created inside the TPM and signed by Vault; no key material moved, and no root token on the device — the CSR is signed with a one-shot AppRole token |
+| 4–5 | `task config` | Trust is configured explicitly — a device CA, one issuing role, the `device-read`, `device-enrol` and `enrol-orchestrator` policies, the `device-enrol` AppRole, the orchestrator's token, one cert auth role. The one step that legitimately uses the root token |
+| 6 | `task enrol` | The device identity is created inside the TPM and signed by Vault; no key material moved, and no root token anywhere in the step — the orchestrator mints with a scoped token, and the CSR is signed with a one-shot AppRole token |
 | 6.2 | `task demo:nonexportable` | The file on disk is a TSS2 wrapped blob. Only a public key can be recovered from it |
 | 7 | `task demo:login` | A TPM-held key authenticates to Vault over mTLS and returns a real token |
 | 7.3 | `task demo:privilege` | The token is least-privilege: the read succeeds, the write is denied |
@@ -236,7 +259,8 @@ All lab state lives inside the VM, owned by the `ubuntu` user, under `~/lab`:
 | Path | Contents |
 |---|---|
 | `~/lab/env.sh` | The TCTI and Vault environment (`TPM2TOOLS_TCTI`, `TPM2OPENSSL_TCTI`, `VAULT_ADDR`, `VAULT_CACERT`, `VAULT_TOKEN`). Every scripted command sources this, so an interactive `task shell` session sees exactly the same environment |
-| `~/lab/state/` | Software TPM state, one directory per swtpm instance. The device TPM's storage seed lives here — this is what makes the key blob machine-bound |
+| `~/lab/state/` | Lab state: `config.json` (the Parts 4-5 sentinel) and `orchestrator.token` (mode 0600 — the scoped credential `task enrol` spends to mint the device's SecretID) |
+| `~/lab/tpmstate/` | Software TPM state, one directory per swtpm instance. The device TPM's storage seed lives here — this is what makes the key blob machine-bound |
 | `~/lab/vault-tls/` | The dev server's own TLS material: `vault-ca.pem`, `vault-cert.pem`, `vault-key.pem` |
 | `~/lab/pki/` | Device PKI artefacts: the lab device CA certificate, the TPM key blob, the CSR, the issued device certificate and its serial |
 
@@ -265,9 +289,9 @@ one.
 | `task provision` | Installs swtpm, tpm2-tools, tpm2-openssl and Vault in the VM | Slowest step; safe to re-run |
 | `task tpm` | Installs and starts both swtpm units | Both units active; `tpm2_getrandom` returns bytes |
 | `task vault` | Starts the Vault dev server unit | `vault status` shows `Sealed false`, `Storage Type inmem` |
-| `task config` | Enables PKI, generates the device CA, creates the `devices` role, writes the KV secret, the `device-read` and `device-enrol` policies and the `device-enrol` AppRole, enables and configures cert auth | Re-runnable; this is the step to repeat after a Vault restart. Uses the root token, correctly — this is the operator provisioning trust |
-| `task enrol` | Generates the TPM key, builds the CSR, mints a response-wrapped one-shot SecretID as the operator, then redeems it as the device to sign the CSR | Certificate with the expected subject, issuer and client-auth EKU; no root token used on the device side |
-| `task lab` | All of the above in order | Ends with "Lab ready" |
+| `task config` | Enables PKI, generates the device CA, creates the `devices` role, writes the KV secret, the `device-read`, `device-enrol` and `enrol-orchestrator` policies, the `device-enrol` AppRole and the orchestrator's scoped token, enables and configures cert auth | Re-runnable; this is the step to repeat after a Vault restart. Uses the root token, correctly — this is the operator provisioning trust |
+| `task enrol` | Generates the TPM key, builds the CSR, mints a response-wrapped one-shot SecretID as the orchestrator, then redeems it as the device to sign the CSR | Certificate with the expected subject, issuer and client-auth EKU; no root token used at any point in the step |
+| `task all` | All of the above in order | Ends with "Lab ready" |
 | `task demo:nonexportable` | Shows the TSS2 header and the public-key-only extraction | The talking point that lands hardest |
 | `task demo:login` | The mTLS login | A client token with policies `default` and `device-read` |
 | `task demo:privilege` | Read then write with the device token | Read succeeds, write is denied |
@@ -308,7 +332,8 @@ needs rebuilding from scratch for that.
 | `swtpm` over `swtpm:port=2321` | Hardware or firmware TPM via `device:/dev/tpmrm0` — the only change below the application layer |
 | `vault server -dev -dev-tls` | HA cluster with Raft storage, a real server certificate, and auto-unseal |
 | Root CA generated inside the PKI mount | Intermediate PKI mount chained to the enterprise root, with the root kept offline |
-| Root token for operator work — `task config`, and minting enrolment SecretIDs. The device itself never holds it | Scoped admin policies; the root token generated only for break-glass and revoked afterwards |
+| Root token for operator work — `task config` only. Minting enrolment SecretIDs uses the scoped `enrol-orchestrator` token, and the device never holds either | Scoped admin policies throughout; the root token generated only for break-glass and revoked afterwards |
+| The orchestrator's token written to a file on the same box, minted fresh on every `task config` | The provisioning system authenticates as its own workload identity, with short-lived credentials it renews rather than a token at rest |
 | `openssl s_client` driving the handshake | A client that loads the TPM key as a `crypto.Signer`, builds a `tls.Certificate`, and calls `auth/cert/login` through a Vault SDK |
 | Enrolment authorised by a response-wrapped, single-use AppRole SecretID, still trusting that the key is in a TPM | Automated enrolment gated by EK/AK attestation, so Vault has cryptographic evidence of TPM residency before it signs, rather than trusting whoever received the wrapping token |
 | 24-hour certificates, CRL loaded manually | Short-lived certificates with automatic renewal, plus OCSP or scheduled CRL refresh |

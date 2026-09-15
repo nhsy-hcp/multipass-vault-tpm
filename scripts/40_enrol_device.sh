@@ -29,6 +29,12 @@ APPROLE="device-enrol"
 APPROLE_PATH="auth/approle/role/${APPROLE}"
 WRAP_TTL="120s"
 
+# The orchestrator's own credential, created by 'task config' (Part 5.5). Its
+# policy grants exactly two things: 'update' on the SecretID path above and
+# 'read' on the RoleID path. It cannot sign a CSR — that is the device's job,
+# with the credential minted here.
+ORCH_TOKEN_FILE="${LAB_STATE_DIR}/orchestrator.token"
+
 # auth/approle/login is an unauthenticated path, so Vault ignores whatever token
 # the CLI attaches to it — but leaving VAULT_TOKEN alone would put 'root' on the
 # wire during the very step that is meant to prove root is not involved, and an
@@ -141,12 +147,18 @@ as_lab_user openssl req -in "${CSR}" -noout -verify -subject
 # The flow is deliberately two-sided, and the output labels each side, because
 # the separation IS the point:
 #
-#   operator (root)  : mint the wrapped SecretID   <- privileged; done elsewhere
-#   device (no root) : unwrap -> login -> sign CSR <- all the device ever sees
+#   operator     (root)         : configure trust           <- task config
+#   orchestrator (scoped token) : mint the wrapped SecretID <- 6.4.1, elsewhere
+#   device       (no root)      : unwrap -> login -> sign   <- all it ever sees
+#
+# Nothing below this line holds the root token. The orchestrator's is scoped to
+# minting enrolment credentials and reading the public RoleID; the device's is
+# scoped to signing one CSR. Root configured the trust, in Parts 4-5, and then
+# went away.
 #
 # Mechanics: as_lab_user runs `bash -lc "source ${LAB_DIR}/env.sh; <cmd>"`, and
-# env.sh exports VAULT_TOKEN=root, so a device-side call cannot simply be given
-# a different token — the source would overwrite it. Each one therefore uses
+# env.sh exports VAULT_TOKEN=root, so no call below can simply be given a
+# different token — the source would overwrite it. Each one therefore uses
 # `env VAULT_TOKEN=<token> vault ...`, which the shell executes *after* the
 # source has run, and an environment variable beats both the sourced value and
 # the ~/.vault-token helper file. Same idiom as scripts/60_privilege.sh.
@@ -168,20 +180,45 @@ redact() {
   if (( ${#v} > 8 )); then printf '%s...' "${v:0:8}"; else printf '(%d chars)' "${#v}"; fi
 }
 
-# ---- operator side: uses the root token ------------------------------------
-log_step "6.4.1 (OPERATOR, root token): mint a response-wrapped SecretID"
+# ---- orchestrator side: a scoped token, never the root token ----------------
+log_step "6.4.1 (ORCHESTRATOR, scoped token): mint a response-wrapped SecretID"
 
-as_lab_user_allow_fail vault read "${APPROLE_PATH}" >/dev/null 2>&1 \
-  || die "no AppRole role at ${APPROLE_PATH} — run 'task config' first (it creates the '${APPROLE}' role and policy)"
+# This script runs as root inside the VM, so it can read the lab user's 0600
+# credential file directly. What matters is which token goes on the wire below,
+# and it is not the root one.
+[[ -s "${ORCH_TOKEN_FILE}" ]] \
+  || die "no orchestrator token at ${ORCH_TOKEN_FILE} — run 'task config' first (Part 5.5 mints it)"
+orch_token="$(<"${ORCH_TOKEN_FILE}")"
+[[ -n "${orch_token}" ]] || die "${ORCH_TOKEN_FILE} is empty — re-run 'task config'"
+log_detail "orchestrator token $(redact "${orch_token}") — policy 'enrol-orchestrator', two paths, nothing else"
+
+# role_id is the stable half of an AppRole: it names the role, it does not
+# authenticate, and it is not a secret. On a real fleet it is baked into the
+# device image at build time and handed over with the wrapping token, which is
+# why it is read here — orchestrator-side — rather than by the device.
+#
+# Reading it doubles as the precondition check. The older form read the role
+# object itself, which the orchestrator policy deliberately does not permit:
+# inspecting the role is operator business. Reading the RoleID proves the role
+# exists just as well, and stays inside the two paths the policy grants.
+rc=0
+role_id="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
+  vault read -field=role_id "${APPROLE_PATH}/role-id" 2>"${ERR_LOG}")" || rc=$?
+(( rc == 0 )) \
+  || die "could not read ${APPROLE_PATH}/role-id as the orchestrator (vault exit ${rc}): $(vault_error) — run 'task config' first (it creates the '${APPROLE}' role and the orchestrator's policy)"
+[[ -n "${role_id}" ]] || die "${APPROLE_PATH}/role-id returned an empty role_id"
+log_detail "role_id ${role_id} (shown in full: bakeable, not a secret)"
 
 log_info "Minting a SecretID for '${APPROLE}', response-wrapped for ${WRAP_TTL}."
-log_detail "  vault write -f -wrap-ttl=${WRAP_TTL} ${APPROLE_PATH}/secret-id"
+log_detail "  VAULT_TOKEN=<orchestrator> vault write -f -wrap-ttl=${WRAP_TTL} ${APPROLE_PATH}/secret-id"
 log_detail "  Minting is itself a privileged operation — it needs 'update' on"
-log_detail "  ${APPROLE_PATH}/secret-id. In a real fleet a provisioning"
-log_detail "  system does this; the device never holds the credential that mints."
+log_detail "  ${APPROLE_PATH}/secret-id. That is the orchestrator's entire"
+log_detail "  privilege: mint enrolment credentials, read the public RoleID, and"
+log_detail "  nothing else. It cannot sign the CSR — only the device's token can."
 
 rc=0
-wrap_json="$(as_lab_user_allow_fail vault write -f -format=json \
+wrap_json="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
+  vault write -f -format=json \
   -wrap-ttl="${WRAP_TTL}" "${APPROLE_PATH}/secret-id" 2>"${ERR_LOG}")" || rc=$?
 (( rc == 0 )) \
   || die "could not mint a wrapped SecretID (vault exit ${rc}): $(vault_error)"
@@ -190,16 +227,6 @@ wrap_token="$(printf '%s' "${wrap_json}" | jq -r '.wrap_info.token // empty')" |
 [[ -n "${wrap_token}" ]] \
   || die "the mint response carried no .wrap_info.token — was -wrap-ttl honoured? Inspect: vault write -f -wrap-ttl=${WRAP_TTL} ${APPROLE_PATH}/secret-id"
 log_ok "wrapping token $(redact "${wrap_token}") — unwraps exactly once, expires in ${WRAP_TTL}"
-
-# role_id is the stable half of an AppRole: it names the role, it does not
-# authenticate, and it is not a secret. On a real fleet it is baked into the
-# device image at build time and handed over with the wrapping token, which is
-# why it is read here — operator-side — rather than by the device.
-rc=0
-role_id="$(as_lab_user_allow_fail vault read -field=role_id "${APPROLE_PATH}/role-id" 2>"${ERR_LOG}")" || rc=$?
-(( rc == 0 )) || die "could not read the role_id (vault exit ${rc}): $(vault_error)"
-[[ -n "${role_id}" ]] || die "${APPROLE_PATH}/role-id returned an empty role_id"
-log_detail "role_id ${role_id} (shown in full: bakeable, not a secret)"
 
 # ---- device side: must never see the root token -----------------------------
 log_step "6.4.2 (DEVICE, no root token): unwrap to obtain the SecretID"

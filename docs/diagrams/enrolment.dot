@@ -7,12 +7,14 @@ digraph enrolment {
   bgcolor="white";
   compound=true;
   splines=spline;
-  nodesep=0.40;
-  ranksep=0.50;
+  nodesep=0.55;
+  ranksep=0.70;
+  pad=0.35;
   fontname="Helvetica";
-  fontsize=11;
+  fontsize=12;
+  fontcolor="#1a202c";
   labelloc="t";
-  label="Enrolment and login — the private key never leaves the TPM,\nand the device never holds the root token";
+  label="Enrolment and login — the private key never leaves the TPM,\nand neither side of enrolment holds the root token";
 
   node [
     shape=box,
@@ -23,12 +25,12 @@ digraph enrolment {
     fillcolor="#f7fafc",
     fontcolor="#1a202c",
     penwidth=1.1,
-    margin="0.20,0.11"
+    margin="0.26,0.16"
   ];
 
   edge [
     fontname="Helvetica",
-    fontsize=9,
+    fontsize=10,
     color="#4a5568",
     fontcolor="#2d3748",
     penwidth=1.0,
@@ -48,7 +50,7 @@ digraph enrolment {
     style="filled",
     fillcolor="#f3f8f2",
     color="#5f8a57",
-    fontsize=9
+    fontsize=10
   ];
 
   // ------------------------------------------------------------------- 2. CSR
@@ -58,18 +60,20 @@ digraph enrolment {
     color="#5f8a57"
   ];
 
-  // ------------------------------------------- 3. operator mints the credential
-  subgraph cluster_operator {
-    label="Operator  —  provisioning system, holds the root token";
+  // --------------------------------------- 3. orchestrator mints the credential
+  subgraph cluster_orchestrator {
+    label="Orchestrator  —  provisioning system, scoped token (not root)";
     labeljust="l";
-    fontsize=10;
+    fontsize=12;
+    fontcolor="#1a202c";
+    margin=16;
     style="rounded,filled";
     fillcolor="#eef2f7";
     color="#8fa0b5";
     penwidth=1.2;
 
     s3 [
-      label="3.  vault write -f -wrap-ttl=120s\nauth/approle/role/device-enrol/secret-id\nprivileged: update on .../secret-id",
+      label="3.  vault write -f -wrap-ttl=120s\nauth/approle/role/device-enrol/secret-id\nenrol-orchestrator token — its only privilege:\nupdate on .../secret-id (wrapping mandatory)",
       fillcolor="#ece0f2",
       color="#7d5b92"
     ];
@@ -80,7 +84,7 @@ digraph enrolment {
       style="filled",
       fillcolor="#f7f0fa",
       color="#7d5b92",
-      fontsize=9
+      fontsize=10
     ];
 
     s3 -> wrap [color="#7d5b92"];
@@ -90,7 +94,9 @@ digraph enrolment {
   subgraph cluster_device {
     label="Device  —  no root token, ever";
     labeljust="l";
-    fontsize=10;
+    fontsize=12;
+    fontcolor="#1a202c";
+    margin=16;
     style="rounded,filled";
     fillcolor="#fdf7ec";
     color="#d9b678";
@@ -114,7 +120,7 @@ digraph enrolment {
       style="filled",
       fillcolor="#f7f0fa",
       color="#7d5b92",
-      fontsize=9
+      fontsize=10
     ];
 
     s5 -> s6 [color="#7d5b92"];
@@ -142,7 +148,7 @@ digraph enrolment {
     style="filled",
     fillcolor="#ece0f2",
     color="#7d5b92",
-    fontsize=9,
+    fontsize=10,
     margin="0.05,0.02"
   ];
 
@@ -152,7 +158,7 @@ digraph enrolment {
     style="filled",
     fillcolor="#ece0f2",
     color="#7d5b92",
-    fontsize=9,
+    fontsize=10,
     margin="0.05,0.02"
   ];
 
@@ -193,7 +199,11 @@ digraph enrolment {
   // the weak link: the wrapping token still has to reach the device somehow
   wrap -> s5 [
     lhead=cluster_device,
-    label="4.  delivery out of band\n— the weak link —\nsecure introduction,\nstill unsolved",
+    # This edge crosses a cluster boundary, so its label lands where the dashed
+    # line and the Device cluster's border both are. minlen buys vertical room
+    # and the leading spaces push the text clear of the line itself.
+    label="   4.  delivery out of band\n   — the weak link —\n   secure introduction,\n   still unsolved",
+    minlen=2,
     style=dashed,
     penwidth=1.4,
     color="#a35b5b",

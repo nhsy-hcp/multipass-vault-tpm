@@ -37,17 +37,17 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 | `stop` (`down`) | Stop the VM, keeping lab state on disk |
 | `shell` | Interactive shell in the VM |
 | `clean` | Delete and purge the VM entirely |
-| `rebuild` | `clean`, then `lab` |
+| `rebuild` | `clean`, then `all` |
 
 **Lab build** — each step idempotent and individually re-runnable
 
 | Task | Purpose |
 |---|---|
-| `lab` | launch → provision → tpm → vault → config → enrol |
+| `all` | launch → provision → tpm → vault → config → enrol |
 | `provision` | Part 1: install TPM tooling and Vault in the VM |
 | `tpm` | Part 2: start both software TPMs as systemd units |
 | `vault` | Part 3: start the Vault dev server (TLS) as a systemd unit |
-| `config` | Parts 4–5: PKI device CA, KV secret, policy, cert auth |
+| `config` | Parts 4–5: PKI device CA, KV secret, policies, cert auth, enrolment AppRole and orchestrator token |
 | `enrol` | Part 6: create the device key in the TPM and enrol it with Vault |
 
 **Demo**
@@ -104,24 +104,32 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 ## Gotchas
 
 - **Vault dev mode is in-memory.** Restarting `vault-dev` wipes the PKI mount, the
-  policy, cert auth and the KV secret. The fix is always `task config && task enrol` —
+  policies, cert auth, the KV secret and every token — including the orchestrator token
+  at `~/lab/state/orchestrator.token`. The fix is always `task config && task enrol` —
   never a full rebuild.
 - **Never "fix" the demo with a software key.** If the TPM path fails, diagnose the TPM
   path. Generating a plain EC key and pointing OpenSSL at it makes every command succeed
   and destroys the entire point of the lab.
-- **Device enrolment does not use the root token.** `task enrol` mints a
-  response-wrapped, one-shot AppRole SecretID as the *operator*
-  (`vault write -f -wrap-ttl=120s auth/approle/role/device-enrol/secret-id`), then
-  redeems it as the *device* (`vault unwrap` → `auth/approle/login` →
+- **Device enrolment does not use the root token — on either side.** `task enrol` mints
+  a response-wrapped, one-shot AppRole SecretID as the *orchestrator*, using the scoped
+  token `task config` leaves at `~/lab/state/orchestrator.token` (policy
+  `enrol-orchestrator`: `update` on `auth/approle/role/device-enrol/secret-id` with
+  `min_wrapping_ttl` making the wrap mandatory, `read` on `.../role-id`, nothing else).
+  It then redeems it as the *device* (`vault unwrap` → `auth/approle/login` →
   `pki/sign/devices`). The resulting `device-enrol` token carries exactly one
   capability: `update` on `pki/sign/devices`. `task config` still uses root, and that is
-  correct — it is the operator provisioning trust, not a device authenticating.
-- **The operator/device split in `scripts/40_enrol_device.sh` is the point.** It is two
-  privilege domains in one script, deliberately. Do not "simplify" it by signing the CSR
+  correct — it is the operator provisioning trust, not a device authenticating, and
+  issuing the orchestrator its token is part of that same job.
+- **The orchestrator/device split in `scripts/40_enrol_device.sh` is the point.** It is
+  two privilege domains in one script, deliberately — three counting the operator who
+  configured both in `task config`. Do not "simplify" it by signing the CSR
   with the root token, by skipping the wrap and passing the SecretID directly, or by
-  giving the `device-enrol` policy anything beyond its single capability. Each of those
-  makes the script shorter and deletes what it demonstrates. See
-  `docs/architecture.md` → Trust model.
+  giving the `device-enrol` policy anything beyond its single capability. Nor by putting
+  root back in 6.4.1 because it is two lines shorter, nor by widening
+  `enrol-orchestrator` so the old `vault read auth/approle/role/device-enrol` preflight
+  works again — reading `.../role-id` *is* the check, precisely because that is all the
+  orchestrator may read. Each of those makes the script shorter and deletes what it
+  demonstrates. See `docs/architecture.md` → Trust model.
 - **The attacker TPM is not a spare.** `swtpm@attacker` on :2331 exists solely so Part
   8.1 can present the device's key blob to a TPM with a different storage seed. It must
   keep its own state directory and must never share a seed with `swtpm@device`.

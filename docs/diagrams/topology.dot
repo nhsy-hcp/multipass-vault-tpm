@@ -7,10 +7,12 @@ digraph topology {
   bgcolor="white";
   compound=true;
   splines=spline;
-  nodesep=0.35;
-  ranksep=0.85;
+  nodesep=0.55;
+  ranksep=0.70;
   fontname="Helvetica";
-  fontsize=11;
+  fontsize=12;
+  fontcolor="#1a202c";
+  pad=0.35;
 
   node [
     shape=box,
@@ -26,7 +28,7 @@ digraph topology {
 
   edge [
     fontname="Helvetica",
-    fontsize=9,
+    fontsize=10,
     color="#4a5568",
     fontcolor="#2d3748",
     penwidth=1.0,
@@ -37,7 +39,9 @@ digraph topology {
   subgraph cluster_host {
     label="macOS host";
     labeljust="l";
-    fontsize=11;
+    fontsize=12;
+    fontcolor="#1a202c";
+    margin=16;
     style="rounded,filled";
     fillcolor="#eef2f7";
     color="#8fa0b5";
@@ -53,7 +57,9 @@ digraph topology {
   subgraph cluster_vm {
     label="Ubuntu 24.04 arm64 VM  (tpm-lab)";
     labeljust="l";
-    fontsize=11;
+    fontsize=12;
+    fontcolor="#1a202c";
+    margin=16;
     style="rounded,filled";
     fillcolor="#e8f0f8";
     color="#7f9bb8";
@@ -69,8 +75,8 @@ digraph topology {
       label="swtpm@attacker\ntcp :2331\ndifferent storage seed\n(Part 8.1 only)",
       style="rounded,filled,dashed",
       fillcolor="#f2f2f0",
-      color="#9a9a94",
-      fontcolor="#5a5a54"
+      color="#6b6b64",
+      fontcolor="#3d3d38"
     ];
 
     client [
@@ -83,7 +89,9 @@ digraph topology {
     subgraph cluster_vault {
       label="vault-dev  —  https://127.0.0.1:8200  (dev, in-memory)";
       labeljust="l";
-      fontsize=10;
+      fontsize=12;
+      fontcolor="#1a202c";
+      margin=16;
       style="rounded,filled";
       fillcolor="#f4eaf6";
       color="#9e7fae";
@@ -98,7 +106,9 @@ digraph topology {
   // ---------------------------------------------------------------- host -> VM
   mpcli -> client [
     lhead=cluster_vm,
-    label="multipass transfer / exec",
+    # Trailing blank line lifts the text clear of the dashed spline, which
+    # otherwise runs straight through it on this long horizontal edge.
+    label="multipass transfer / exec\n ",
     style=dashed,
     color="#6b7280"
   ];
@@ -112,10 +122,16 @@ digraph topology {
   client -> kv     [label="4. read (write denied)", color="#b5883f", fontcolor="#7d5c22"];
 
   client -> attacker [
-    label="Part 8.1: same key blob,\ndifferent TPM → handshake fails",
+    # constraint=false leaves this edge out of rank assignment, so the spline
+    # runs straight through a plain centred label. Graphviz trims whitespace
+    # padding, so the clearance has to be structural: an HTML label with an
+    # empty right-hand cell shifts the text off the line.
+    label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="0" CELLSPACING="0"><TR>
+             <TD ALIGN="RIGHT">Part 8.1:<BR/>same key blob,<BR/>different TPM &#8594;<BR/>handshake fails</TD>
+             <TD WIDTH="24"></TD></TR></TABLE>>,
     style=dashed,
-    color="#9a9a94",
-    fontcolor="#5a5a54",
+    color="#6b6b64",
+    fontcolor="#3d3d38",
     constraint=false
   ];
 }
