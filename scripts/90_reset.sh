@@ -40,4 +40,4 @@ lab_mkdir "${LAB_DIR}" "${LAB_STATE_DIR}" "${LAB_TLS_DIR}" "${LAB_PKI_DIR}" "${L
 log_info ""
 log_ok "Lab reset. Packages and the VM are untouched."
 log_info "Rebuild with: task tpm && task vault && task config && task enrol"
-log_detail "(or simply: task lab)"
+log_detail "(or simply: task all)"

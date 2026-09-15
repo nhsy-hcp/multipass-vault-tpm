@@ -34,11 +34,11 @@ brew install go-task jq graphviz shellcheck gitleaks pre-commit
 ```bash
 task deps    # verify host tooling
 task init    # one-time project setup (pre-commit hooks, .env)
-task lab     # launch the VM, provision it, start the TPMs and Vault, enrol node01
+task all     # launch the VM, provision it, start the TPMs and Vault, enrol node01
 task demo    # the narrated walkthrough, including every negative test
 ```
 
-`task lab` takes a few minutes on first run; each of its steps is idempotent and
+`task all` takes a few minutes on first run; each of its steps is idempotent and
 individually re-runnable. `task demo` takes under a minute.
 
 ## All tasks

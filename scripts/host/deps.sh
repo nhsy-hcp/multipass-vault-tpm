@@ -47,4 +47,4 @@ log_info ''
 log_detail "Apple Silicon hosts create arm64 guests; the HashiCorp apt repo and"
 log_detail "Ubuntu TPM packages both publish arm64 builds, so no changes are needed."
 
-log_ok "host is ready — next: task lab"
+log_ok "host is ready — next: task all"

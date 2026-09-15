@@ -48,7 +48,7 @@ tasks:
       - pre-commit install
       - cmd: test -f .env || cp .env.template .env
         ignore_error: true
-      - echo "Project initialised. Next- task deps, then task lab"
+      - echo "Project initialised. Next- task deps, then task all"
     silent: true
 
   clean:tmp:
@@ -61,7 +61,7 @@ tasks:
   launch:
     desc: Launch the Multipass VM (no-op if it already exists)
     # Fail fast on a missing host tool rather than deep inside a provisioning
-    # script. `lab` reaches the VM only through here, so one gate covers both.
+    # script. `all` reaches the VM only through here, so one gate covers both.
     deps: [deps]
     status:
       - multipass info {{.NAME}} >/dev/null 2>&1
@@ -95,7 +95,7 @@ tasks:
     desc: Destroy everything and rebuild the lab from scratch
     cmds:
       - task: clean
-      - task: lab
+      - task: all
 
   # ==========================================================================
   # Logs
@@ -116,7 +116,7 @@ tasks:
   # ==========================================================================
   # Lab build — each step is idempotent and individually re-runnable
   # ==========================================================================
-  lab:
+  all:
     desc: Build the whole lab (provision, tpm, vault, config, enrol)
     cmds:
       - task: launch
