@@ -138,10 +138,28 @@ fi
 # look like a real manufactured one, and it leaves the door open for the Part
 # 9.3 / EK-attestation stretch goals. It is best-effort — a failure here is
 # logged and the socket is started regardless, since the socket does not depend
-# on it. UNCERTAINTY: confirm on the first real run that swtpm_setup succeeds
-# on 24.04 arm64 (it shells out to swtpm_localca, which wants certtool from
-# gnutls-bin); if it warns, check that the units still come up, which they
-# should.
+# on it. Confirmed on 24.04 arm64 (swtpm 0.7.3): the first real run failed
+# twice over, and the units still came up on swtpm's default state as predicted.
+#   1. "Could not create temporary directory for certs: Permission denied" —
+#      common.sh created the scratch dir root-owned and the lab user inherited
+#      TMPDIR pointing at it. Fixed in common.sh (chown to the lab user).
+#   2. "swtpm_localca: Need read/write rights on statedir
+#      /var/lib/swtpm-localca for user ubuntu" — the packaged local CA that
+#      signs the EK/platform certs lives in a directory owned by the `swtpm`
+#      system user. Fixed below: swtpm_setup reads ~/.config/swtpm_setup.conf
+#      before /etc, and --create-config-files writes a per-user config whose
+#      local CA lives under ~/.config/var/lib/swtpm-localca. certtool is not
+#      needed; swtpm_localca 0.7.3 creates the CA key itself.
+#
+# Per-user swtpm_setup config for the lab user. skip-if-exist makes it
+# idempotent, and it does not touch /etc or the packaged local CA.
+log_info "Ensuring ${LAB_USER} has a per-user swtpm_setup config (~/.config)..."
+if as_lab_user swtpm_setup --create-config-files skip-if-exist; then
+  log_ok "swtpm_setup per-user config present for ${LAB_USER}"
+else
+  log_warn "could not create per-user swtpm_setup config — manufacturing below may fall back to the packaged local CA and fail; the socket does not depend on it"
+fi
+
 for inst in "${INSTANCES[@]}"; do
   state_dir="${STATE_ROOT}/${inst}"
   marker="${state_dir}/.lab-setup-done"
