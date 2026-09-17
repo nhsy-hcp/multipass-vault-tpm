@@ -13,17 +13,16 @@ STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${STAGE_DIR}/common.sh"
 
 DEVICE="${1:-node01}"
-ATT_STATE="${LAB_TPM_DIR}/attacker"
+ATT_STATE="${TPM_DIR}/attacker"
 OTHER_NAME="node99"
 OTHER_ROLE="other"
 OTHER_CN="${OTHER_NAME}.other.lab.local"
-NO_TOKEN="device-holds-no-token"
 
 log_step "Part 8.4: a trusted-CA certificate bound to the wrong role"
 
 [[ -S "${ATTACKER_TPM_SOCK}" ]] || die "no attacker TPM at ${ATTACKER_TPM_SOCK} — run 'task tpm' first"
 require_cmd jq openssl || die "missing prerequisites"
-lab_mkdir "${LAB_TPM_DIR}" "${ATT_STATE}"
+lab_mkdir "${TPM_DIR}" "${ATT_STATE}"
 
 log_info "The second TPM becomes a legitimate device of a different kind: the operator"
 log_info "registers it as '${OTHER_NAME}' and gives it its own role, '${OTHER_ROLE}'."
@@ -42,24 +41,12 @@ as_lab_user vault write "auth/tpm/role/${OTHER_ROLE}" tpm_ids="${att_id}" token_
 log_ok "registered ${OTHER_NAME} = ${att_id:0:20}…, trusted by role '${OTHER_ROLE}' only"
 
 log_step "Attesting the second TPM against role '${OTHER_ROLE}' (a real attestation)"
-attempt=0
-while :; do
-  attempt=$(( attempt + 1 ))
-  flush_tpm_contexts "${ATTACKER_TPM_SOCK}"
-  rc=0
-  out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
-    vault tpm attest -role-name="${OTHER_ROLE}" \
-      -tpm-device-path="${ATTACKER_TPM_SOCK}" -tpm-state-dir="${ATT_STATE}" \
-      -cert-subject-CN="${OTHER_CN}" 2>&1)" || rc=$?
-  if (( rc == 0 )); then break; fi
-  if printf '%s' "${out}" | grep -qi 'rate limit' && (( attempt < 4 )); then
-    log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying"
-    sleep 12
-  else
-    printf '%s\n' "${out}" >&2
-    die "attestation for ${OTHER_NAME} failed (rc=${rc})"
-  fi
-done
+rc=0
+out="$(tpm_attest "${ATTACKER_TPM_SOCK}" "${ATT_STATE}" "${OTHER_ROLE}" "${OTHER_CN}")" || rc=$?
+if (( rc != 0 )); then
+  printf '%s\n' "${out}" >&2
+  die "attestation for ${OTHER_NAME} failed (rc=${rc})"
+fi
 log_ok "$(printf '%s\n' "${out}" | grep -m1 -v '^[[:space:]]*$')"
 
 log_info ""

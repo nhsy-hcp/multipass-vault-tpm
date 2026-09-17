@@ -20,11 +20,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${LAB_USER}
-Group=${LAB_USER}
-WorkingDirectory=${LAB_DIR}
-Environment=VAULT_LICENSE_PATH=${LAB_DIR}/vault.hclic
-ExecStart=/usr/local/bin/vault server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
+User=${VM_USER}
+Group=${VM_USER}
+WorkingDirectory=${VM_DIR}
+Environment=VAULT_LICENSE_PATH=${VM_DIR}/vault.hclic
+ExecStart=/usr/local/bin/vault server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${TLS_DIR}
 Restart=on-failure
 RestartSec=2
 

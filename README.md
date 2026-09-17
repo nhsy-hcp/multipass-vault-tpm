@@ -53,7 +53,9 @@ task demo    # the narrated walkthrough, including every negative test
 ```
 
 `task all` takes a few minutes on first run; each of its steps is idempotent and
-individually re-runnable. `task demo` takes under a minute.
+individually re-runnable. `task demo` takes under a minute. `.env` (seeded by
+`task init`) can override the VM name, the device name and domain, and where the Vault
+binary and licence live.
 
 ## All tasks
 

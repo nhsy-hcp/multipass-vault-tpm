@@ -24,21 +24,23 @@ log_ok "services stopped"
 # clearing. The licence stays: it belongs to the binary, not the lab state.
 log_info "Removing certificates, key handles and lab state..."
 rm -rf \
-  "${LAB_TPM_DIR:?}" \
-  "${LAB_STATE_DIR:?}" \
-  "${LAB_TLS_DIR:?}" \
-  "${LAB_DIR:?}/logs"
+  "${TPM_DIR:?}" \
+  "${STATE_DIR:?}" \
+  "${TLS_DIR:?}" \
+  "${VM_DIR:?}/logs" \
+  "${VM_DIR:?}/pki" \
+  "${VM_DIR:?}/tpm-login-request.sh"
 log_ok "lab artefacts removed"
 
 # New storage seeds, new endorsement keys: every registration Vault held for
 # the old TPMs would be stale anyway, and every blob is now unrecoverable.
 log_info "Clearing both software TPMs (new storage seeds, new EKs)..."
 rm -rf "${TPM_STATE_ROOT}/device" "${TPM_STATE_ROOT}/attacker"
-install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0700 \
+install -d -o "${VM_USER}" -g "${VM_USER}" -m 0700 \
   "${TPM_STATE_ROOT}/device" "${TPM_STATE_ROOT}/attacker"
 log_ok "TPM state cleared"
 
-lab_mkdir "${LAB_DIR}" "${LAB_STATE_DIR}" "${LAB_TLS_DIR}" "${LAB_TPM_DIR}" "${LAB_DIR}/logs"
+lab_mkdir "${VM_DIR}" "${STATE_DIR}" "${TLS_DIR}" "${TPM_DIR}" "${VM_DIR}/logs"
 
 log_info ""
 log_ok "Lab reset. Packages, the Vault binary and the VM are untouched."

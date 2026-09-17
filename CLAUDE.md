@@ -98,14 +98,20 @@ Run `task --list` for the authoritative version. Grouped by purpose:
   Temp files: the **host** uses the project-local `.tmp/` (never `/tmp`, never the
   session scratchpad); inside the **VM**, `/tmp` is correct and `VM_STAGE` namespaces it.
 - **`as_lab_user` for everything.** Because scripts run as root, every `vault` and
-  `tpm2_*` invocation goes through `as_lab_user`, which drops to the `ubuntu` user and
-  sources `~/lab/env.sh` first. TPM key blobs must be created by the same user that will
+  `tpm2_*` invocation goes through `as_lab_user`, which drops to the `ubuntu` user
+  (`VM_USER`) and sources `~/lab/env.sh` first. In-VM layout variables in `common.sh`
+  carry no `LAB_` prefix: `VM_USER`, `VM_DIR`, `STATE_DIR`, `TLS_DIR`, `TPM_DIR`,
+  `SCRATCH_DIR`. Device attest directories are `DEVICE_DIR` locals, never `STATE_DIR`. TPM key blobs must be created by the same user that will
   later use them, and lab artefacts must not end up root-owned.
 - **One socket per TPM.** Each swtpm serves `~/lab/tpmstate/<instance>/swtpm.sock`
   (plus a `.ctrl` socket for the swtpm TCTI). tpm2-tools use
   `TPM2TOOLS_TCTI=swtpm:path=<sock>`; the Vault CLI uses `-tpm-device-path=<sock>` /
   `tpmDevice=<sock>`. `common.sh` exports `TPM_SOCK` and `ATTACKER_TPM_SOCK`. There are
   no TCP ports any more.
+- **Attest through `tpm_attest`.** `common.sh` owns the device-side attestation call:
+  no token, flush first, retry on the per-EK rate limit. Scripts call it rather than
+  inlining `vault tpm attest`, so the beta-specific workaround lives in one place.
+  `NO_TOKEN` and `mount_enabled` live there too.
 - **Flush before touching the TPM through Vault.** A raw socket has no resource
   manager, and `vault login -method=tpm` leaks one transient handle per call; swtpm has
   three slots. Call `flush_tpm_contexts [sock]` before every `vault tpm …` or
@@ -128,7 +134,10 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 - **Vault dev mode is in-memory.** Restarting `vault-dev` wipes the tpm auth mount and
   its CA, the `identity/tpm` registry, the policies, the KV secret and every token —
   including the orchestrator token at `~/lab/state/orchestrator.token`. The fix is
-  always `task config && task enrol` — never a full rebuild.
+  always `task config && task enrol` — never a full rebuild. `task config` deletes the
+  certificates under `~/lab/tpm/*/` whenever it enables a fresh mount, because they were
+  issued by a CA that no longer exists; without that, `task enrol` would keep them and
+  login would fail. Keep that behaviour.
 - **Never "fix" the demo with a software key or a PEM certificate.** If the TPM path
   fails, diagnose the TPM path. The whole point is that the key exists only inside the
   TPM and that Vault issued the certificate only after attestation.
@@ -139,13 +148,18 @@ Run `task --list` for the authoritative version. Grouped by purpose:
   "simplify" by letting them inherit `VAULT_TOKEN=root` from `env.sh`.
 - **The orchestrator/device split in `scripts/40_enrol_device.sh` is the point.** Three
   privilege domains: the operator (root, `task config`) configures trust; the
-  orchestrator (scoped token, `enrol-orchestrator` policy) registers the EK in
-  `identity/tpm` and admits it to the `devices` **group**; the device (no token) attests.
+  orchestrator (scoped token, `enrol-orchestrator` policy: two paths) registers the EK
+  in `identity/tpm` and admits it to the `devices` **group**; the device (no token)
+  attests.
   The role trusts the group, not individual IDs, precisely so the orchestrator never
   needs write access to the auth role — a role write could change `token_policies`.
   Do not register the EK with root because it is shorter, do not give the orchestrator
   `auth/tpm/role/*`, and do not bind the role to `tpm_ids` directly. See
   `docs/architecture.md` → Trust model.
+- **The common name is not an identity.** The device chooses its own CN at attestation
+  and nothing checks it; the TPM ID and role in the SAN are what `auth/tpm/login`
+  enforces. Never present the CN as "who this is" in narration or docs, and never build
+  policy on it.
 - **`disabled=true` on a TPM record does nothing in this beta.** It blocked neither
   attestation nor login when tested. Revocation means removing the TPM from the group,
   deleting the record, or revoking tokens. Retest on new builds.

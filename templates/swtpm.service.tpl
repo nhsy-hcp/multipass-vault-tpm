@@ -21,8 +21,8 @@ Documentation=man:swtpm(8)
 
 [Service]
 Type=simple
-User=${LAB_USER}
-Group=${LAB_USER}
+User=${VM_USER}
+Group=${VM_USER}
 ExecStartPre=/bin/rm -f ${TPM_STATE_ROOT}/%i/swtpm.sock ${TPM_STATE_ROOT}/%i/swtpm.sock.ctrl
 ExecStart=/usr/bin/swtpm socket --tpm2 --tpmstate dir=${TPM_STATE_ROOT}/%i --server type=unixio,path=${TPM_STATE_ROOT}/%i/swtpm.sock --ctrl type=unixio,path=${TPM_STATE_ROOT}/%i/swtpm.sock.ctrl --flags not-need-init,startup-clear
 Restart=on-failure

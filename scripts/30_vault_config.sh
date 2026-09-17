@@ -11,11 +11,11 @@ source "${STAGE_DIR}/common.sh"
 
 DOMAIN="${1:-devices.lab.local}"
 
-# The demo secret belongs to node01. The policy below covers every device path,
-# so enrolling a second device needs no change here.
-DEMO_DEVICE="node01"
+# The demo secret belongs to the device 'task enrol' will enrol. The policy
+# below covers every device path, so a second device needs no change here.
+DEMO_DEVICE="${2:-node01}"
 
-SENTINEL="${LAB_STATE_DIR}/config.json"
+SENTINEL="${STATE_DIR}/config.json"
 
 # Vault Enterprise's tpm auth method. It carries its own CA: device certificates
 # are issued by the mount itself at the end of an EK/AK attestation, so there is
@@ -29,21 +29,14 @@ TPM_ROLE="devices"
 # that, and created here because issuing it is part of the same
 # trust-establishing job as everything else in Parts 4-5. See Part 5.5 below.
 ORCH_POLICY="enrol-orchestrator"
-ORCH_TOKEN_FILE="${LAB_STATE_DIR}/orchestrator.token"
-
-# True when the named mount is already present at the given path ("tpm/").
-mount_enabled() {
-  local kind="$1" path="$2"
-  as_lab_user vault "${kind}" list -format=json 2>/dev/null \
-    | jq -e --arg p "${path}" 'has($p)' >/dev/null 2>&1
-}
+ORCH_TOKEN_FILE="${STATE_DIR}/orchestrator.token"
 
 log_step "Parts 4-5: tpm auth method, demo secret, policy, device group and role"
 
 require_cmd jq install || die "missing tooling — run 'task provision' first"
-[[ -f "${LAB_DIR}/env.sh" ]] || die "no ${LAB_DIR}/env.sh — run 'task provision' first"
+[[ -f "${VM_DIR}/env.sh" ]] || die "no ${VM_DIR}/env.sh — run 'task provision' first"
 
-lab_mkdir "${LAB_STATE_DIR}"
+lab_mkdir "${STATE_DIR}"
 
 # Vault dev mode is in-memory: a restart wipes every mount configured below.
 # Waiting here makes this script safe to run immediately after 'task vault'.
@@ -62,6 +55,15 @@ if mount_enabled auth "${TPM_MOUNT}/"; then
 else
   log_info "Enabling the tpm auth method at auth/${TPM_MOUNT}"
   as_lab_user vault auth enable -path="${TPM_MOUNT}" tpm
+  # A fresh mount means a fresh internal CA. Certificates issued by the previous
+  # one — still on disk after a Vault restart — look valid but chain to nothing
+  # this mount trusts. Clear them so 'task enrol' re-attests instead of keeping
+  # them; the key blobs stay, they belong to the TPM, not the CA.
+  stale=( "${TPM_DIR}"/*/client.crt )
+  if [[ -e "${stale[0]}" ]]; then
+    log_detected "certificates issued by a previous mount's CA" "removing them so 'task enrol' re-attests"
+    rm -f "${TPM_DIR}"/*/client.crt "${TPM_DIR}"/*/ca_chain.pem
+  fi
 fi
 
 # The mount keeps an active CA and a pre-generated next CA and rotates between
@@ -127,20 +129,16 @@ log_step "Part 5.5: the orchestrator credential that enrols devices"
 # leave the operator side holding unlimited privilege in the very step whose
 # point is least privilege.
 #
-# So the provisioning system gets an identity of its own: three paths, and
+# So the provisioning system gets an identity of its own: two paths, and
 # nothing else. It cannot alter the auth role, read a secret, touch another
 # group, or mint tokens. The device-side attestation is what 'task enrol'
 # demonstrates; this is the other half.
 log_info "Writing the '${ORCH_POLICY}' policy (register EKs, admit them to '${TPM_GROUP}')"
 as_lab_user vault policy write "${ORCH_POLICY}" - <<EOF
-# Register a device's endorsement key. Vault derives the TPM ID from it.
+# Register a device's endorsement key. Vault derives the TPM ID from it and
+# returns it in the response, so nothing else needs reading back.
 path "identity/tpm" {
   capabilities = ["update"]
-}
-
-# Read a registration back by name, to confirm it and recover the TPM ID.
-path "identity/tpm/name/*" {
-  capabilities = ["read"]
 }
 
 # Admit a registered TPM to the group the '${TPM_ROLE}' role trusts. This is
@@ -169,7 +167,7 @@ log_info "Minting the orchestrator token (24h, policy ${ORCH_POLICY})"
 # for a long-running agent and the wrong one for a demonstration of bounded
 # privilege. 24h outlives any demo session, and a Vault restart kills it sooner.
 #
-# -no-default-policy so the transcript shows exactly the three paths above.
+# -no-default-policy so the transcript shows exactly the two paths above.
 orch_json="$(as_lab_user vault token create \
   -policy="${ORCH_POLICY}" \
   -no-default-policy \
@@ -182,7 +180,7 @@ orch_token="$(printf '%s' "${orch_json}" | jq -r '.auth.client_token // empty')"
 # 0600, not 0644: every other lab artefact is a public key, a certificate or a
 # key handle only this TPM can use. This one is a bearer credential.
 printf '%s' "${orch_token}" | write_lab_file "${ORCH_TOKEN_FILE}" 0600
-log_ok "orchestrator token at ${ORCH_TOKEN_FILE} (owner ${LAB_USER}, mode 0600)"
+log_ok "orchestrator token at ${ORCH_TOKEN_FILE} (owner ${VM_USER}, mode 0600)"
 log_detail "Policies: $(printf '%s' "${orch_json}" | jq -r '.auth.policies | join(", ")')"
 log_detail "TTL:      $(printf '%s' "${orch_json}" | jq -r '.auth.lease_duration')s"
 log_detail "It can register an EK and admit it to '${TPM_GROUP}'. It cannot change the"

@@ -14,29 +14,24 @@ CN="${DEVICE}.${DOMAIN}"
 
 # Everything `vault tpm attest` produces lives in one state directory per
 # device: the certificate, the CA chain, and the two TPM key blobs.
-STATE_DIR="${LAB_TPM_DIR}/${DEVICE}"
-EK_PUB="${STATE_DIR}/ek.pub"
-TPM_ID_FILE="${STATE_DIR}/tpm_id"
-CRT="${STATE_DIR}/client.crt"
-SENTINEL="${LAB_STATE_DIR}/config.json"
+DEVICE_DIR="${TPM_DIR}/${DEVICE}"
+EK_PUB="${DEVICE_DIR}/ek.pub"
+TPM_ID_FILE="${DEVICE_DIR}/tpm_id"
+CRT="${DEVICE_DIR}/client.crt"
+SENTINEL="${STATE_DIR}/config.json"
 
 # The orchestrator's credential, created by 'task config' (Part 5.5). Its
-# policy grants exactly three things: register an EK, read a registration back,
-# and admit a TPM to the 'devices' group. It cannot touch the auth role.
-ORCH_TOKEN_FILE="${LAB_STATE_DIR}/orchestrator.token"
+# policy grants exactly two things: register an EK, and admit a TPM to the
+# 'devices' group. It cannot touch the auth role.
+ORCH_TOKEN_FILE="${STATE_DIR}/orchestrator.token"
 
-# The attestation endpoints are unauthenticated, so Vault ignores whatever
-# token the CLI attaches — but leaving VAULT_TOKEN alone would put 'root' on
-# the wire during the very step that is meant to prove the device holds no
-# credential, and an empty value is worse: the CLI falls back to the
-# ~/.vault-token helper file, which the dev server populates with the root
-# token. A deliberate placeholder keeps the demo honest.
-NO_TOKEN="device-holds-no-token"
+# Device-side calls run with NO_TOKEN (see common.sh): the attestation
+# endpoints are unauthenticated, and the placeholder keeps root off the wire.
 
 log_step "Part 6: enrol the device TPM with Vault (${CN})"
 
 require_cmd jq install openssl || die "missing tooling — run 'task provision' first"
-[[ -f "${LAB_DIR}/env.sh" ]] || die "no ${LAB_DIR}/env.sh — run 'task provision' first"
+[[ -f "${VM_DIR}/env.sh" ]] || die "no ${VM_DIR}/env.sh — run 'task provision' first"
 [[ -f "${SENTINEL}" ]] || die "no ${SENTINEL} — run 'task config' first (Parts 4-5)"
 [[ -S "${TPM_SOCK}" ]] || die "no TPM socket at ${TPM_SOCK} — run 'task tpm' first"
 
@@ -45,7 +40,7 @@ TPM_GROUP="$(jq -r '.tpm_group // "devices"' "${SENTINEL}")"
 TPM_ROLE="$(jq -r '.tpm_role // "auth/tpm/role/devices"' "${SENTINEL}")"
 ROLE_NAME="${TPM_ROLE##*/}"
 
-lab_mkdir "${LAB_TPM_DIR}" "${STATE_DIR}"
+lab_mkdir "${TPM_DIR}" "${DEVICE_DIR}"
 
 wait_for "Vault to be unsealed" 60 as_lab_user vault status \
   || die "Vault is not responding — check 'task logs:vault'"
@@ -72,7 +67,7 @@ redact() {
 # presents is its endorsement key — burned into the TPM at manufacture and
 # never leaving it — and the attestation protocol proves possession of it.
 #
-# Mechanics: as_lab_user runs `bash -lc "source ${LAB_DIR}/env.sh; <cmd>"`, and
+# Mechanics: as_lab_user runs `bash -lc "source ${VM_DIR}/env.sh; <cmd>"`, and
 # env.sh exports VAULT_TOKEN=root, so no call below can simply be given a
 # different token — the source would overwrite it. Each one therefore uses
 # `env VAULT_TOKEN=<token> vault ...`, which the shell executes *after* the
@@ -114,7 +109,7 @@ log_step "6.2 (ORCHESTRATOR, scoped token): register the EK, admit the TPM to '$
   || die "no orchestrator token at ${ORCH_TOKEN_FILE} — run 'task config' first (Part 5.5 mints it)"
 orch_token="$(<"${ORCH_TOKEN_FILE}")"
 [[ -n "${orch_token}" ]] || die "${ORCH_TOKEN_FILE} is empty — re-run 'task config'"
-log_detail "orchestrator token $(redact "${orch_token}") — policy 'enrol-orchestrator', three paths, nothing else"
+log_detail "orchestrator token $(redact "${orch_token}") — policy 'enrol-orchestrator', two paths, nothing else"
 
 log_info "Registering the EK as '${DEVICE}' in identity/tpm"
 log_detail "  VAULT_TOKEN=<orchestrator> vault write identity/tpm name=${DEVICE} tpm_ek_public_key=@ek.pub"
@@ -184,9 +179,9 @@ cert_current() {
 }
 
 if cert_current; then
-  log_detected "a valid certificate for ${tpm_id} / role ${ROLE_NAME} in ${STATE_DIR}" "skipping attestation (delete ${STATE_DIR} or run 'task reset' to force it)"
+  log_detected "a valid certificate for ${tpm_id} / role ${ROLE_NAME} in ${DEVICE_DIR}" "skipping attestation (delete ${DEVICE_DIR} or run 'task reset' to force it)"
 else
-  log_info "vault tpm attest -role-name=${ROLE_NAME} -tpm-device-path=${TPM_SOCK} -tpm-state-dir=${STATE_DIR}"
+  log_info "vault tpm attest -role-name=${ROLE_NAME} -tpm-device-path=${TPM_SOCK} -tpm-state-dir=${DEVICE_DIR}"
   log_detail "  1. begin:  the device sends its EK public key and a fresh attestation key (AK);"
   log_detail "             Vault looks the EK up, checks the role trusts it, and returns a"
   log_detail "             secret encrypted so that only that EK can unwrap it — bound to the AK."
@@ -196,34 +191,18 @@ else
   log_detail "             the AK's certification of that key; Vault issues the certificate."
   log_detail "  No Vault token is involved: the EK is the credential."
 
-  attempt=0
-  while :; do
-    attempt=$(( attempt + 1 ))
-    flush_tpm_contexts
-    rc=0
-    attest_out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
-      vault tpm attest \
-        -role-name="${ROLE_NAME}" \
-        -mount-path="${TPM_MOUNT}" \
-        -tpm-device-path="${TPM_SOCK}" \
-        -tpm-state-dir="${STATE_DIR}" \
-        -cert-subject-CN="${CN}" 2>&1)" || rc=$?
-    if (( rc == 0 )); then
-      break
-    elif printf '%s' "${attest_out}" | grep -qi 'rate limit' && (( attempt < 4 )); then
-      log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying (attempt ${attempt})"
-      sleep 12
-    else
-      printf '%s\n' "${attest_out}" >&2
-      die "attestation failed (vault exit ${rc}) — see Vault's message above"
-    fi
-  done
+  rc=0
+  attest_out="$(tpm_attest "${TPM_SOCK}" "${DEVICE_DIR}" "${ROLE_NAME}" "${CN}" "${TPM_MOUNT#auth/}")" || rc=$?
+  if (( rc != 0 )); then
+    printf '%s\n' "${attest_out}" >&2
+    die "attestation failed (vault exit ${rc}) — see Vault's message above"
+  fi
   log_ok "$(printf '%s\n' "${attest_out}" | grep -m1 -v '^[[:space:]]*$')"
 fi
 
 # --- 6.4 what is on disk now -------------------------------------------------
 log_step "6.4: what the device holds now"
-ls -la "${STATE_DIR}" | sed 's/^/  /'
+ls -la "${DEVICE_DIR}" | sed 's/^/  /'
 log_detail "  client.crt / ca_chain.pem  the certificate and the mount's CA"
 log_detail "  app.blob                   the application key: public area + private area sealed to this TPM"
 log_detail "  ak.blob                    the attestation key that certified the application key"
@@ -240,7 +219,7 @@ san="$(as_lab_user openssl x509 -in "${CRT}" -noout -ext subjectAltName | tr -d 
 eku="$(as_lab_user openssl x509 -in "${CRT}" -noout -ext extendedKeyUsage | tr -d '\n')"
 
 log_info ''
-report_expect "subject CN=${CN}" "${subject}"
+report_expect "subject CN=${CN} (what the device asked for — self-asserted, not an enforced identity)" "${subject}"
 report_expect "issuer CN=Vault TPM Auth Internal CA (the mount's own CA)" "${issuer}"
 # The SAN carries two OtherNames under HashiCorp's arc: …55813.1.1.1 is the
 # TPM ID and …55813.1.1.2 is the role name.
@@ -262,8 +241,13 @@ fail=0
 (( fail == 0 )) || die "the issued certificate does not match the '${ROLE_NAME}' role"
 
 log_info ''
+log_detail "Two of those fields are identities Vault enforces at login: the TPM ID and the"
+log_detail "role, both in the SAN. The common name is whatever -cert-subject-CN said, and"
+log_detail "nothing checks it — do not build policy on it. The TPM ID is the device."
+
+log_info ''
 log_info "vault tpm inspect:"
-as_lab_user vault tpm inspect -tpm-state-dir="${STATE_DIR}" | sed 's/^/  /'
+as_lab_user vault tpm inspect -tpm-state-dir="${DEVICE_DIR}" | sed 's/^/  /'
 
 log_ok "Part 6 complete — ${DEVICE} is enrolled"
 log_info ''

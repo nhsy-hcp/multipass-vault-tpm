@@ -31,7 +31,7 @@ declare -A INSTANCE_SOCK=(
 
 require_cmd swtpm swtpm_setup systemctl || die "run 'task provision' first"
 # as_lab_user sources this file, so every later verification depends on it.
-[[ -f "${LAB_DIR}/env.sh" ]] || die "${LAB_DIR}/env.sh is missing — run 'task provision' first"
+[[ -f "${VM_DIR}/env.sh" ]] || die "${VM_DIR}/env.sh is missing — run 'task provision' first"
 
 # --- state directories -------------------------------------------------------
 
@@ -41,13 +41,13 @@ require_cmd swtpm swtpm_setup systemctl || die "run 'task provision' first"
 #
 # Ubuntu ships an enforcing AppArmor profile for swtpm (/etc/apparmor.d/
 # usr.bin.swtpm) that permits state only under `owner @{HOME}/**` and
-# `owner /var/lib/swtpm/**`. Keeping state (and the sockets) under $LAB_DIR
+# `owner /var/lib/swtpm/**`. Keeping state (and the sockets) under $VM_DIR
 # satisfies that policy, so AppArmor stays in enforce mode.
-install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0755 "${STATE_ROOT}"
+install -d -o "${VM_USER}" -g "${VM_USER}" -m 0755 "${STATE_ROOT}"
 for inst in "${INSTANCES[@]}"; do
-  install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0700 "${STATE_ROOT}/${inst}"
+  install -d -o "${VM_USER}" -g "${VM_USER}" -m 0700 "${STATE_ROOT}/${inst}"
 done
-log_ok "state directories under ${STATE_ROOT} (0700, ${LAB_USER})"
+log_ok "state directories under ${STATE_ROOT} (0700, ${VM_USER})"
 
 if [[ -d "${LEGACY_ENV_DIR}" ]]; then
   log_detected "port files from the old TCP layout in ${LEGACY_ENV_DIR}" "removing them — the TPMs now serve unix sockets"
@@ -73,8 +73,8 @@ Documentation=man:swtpm(8)
 
 [Service]
 Type=simple
-User=${LAB_USER}
-Group=${LAB_USER}
+User=${VM_USER}
+Group=${VM_USER}
 ExecStartPre=/bin/rm -f ${STATE_ROOT}/%i/swtpm.sock ${STATE_ROOT}/%i/swtpm.sock.ctrl
 ExecStart=/usr/bin/swtpm socket --tpm2 --tpmstate dir=${STATE_ROOT}/%i --server type=unixio,path=${STATE_ROOT}/%i/swtpm.sock --ctrl type=unixio,path=${STATE_ROOT}/%i/swtpm.sock.ctrl --flags not-need-init,startup-clear
 Restart=on-failure
@@ -108,9 +108,9 @@ fi
 #      /var/lib/swtpm-localca" — the packaged local CA is owned by the `swtpm`
 #      system user. --create-config-files below writes a per-user config whose
 #      local CA lives under ~/.config/var/lib/swtpm-localca.
-log_info "Ensuring ${LAB_USER} has a per-user swtpm_setup config (~/.config)..."
+log_info "Ensuring ${VM_USER} has a per-user swtpm_setup config (~/.config)..."
 if as_lab_user swtpm_setup --create-config-files skip-if-exist; then
-  log_ok "swtpm_setup per-user config present for ${LAB_USER}"
+  log_ok "swtpm_setup per-user config present for ${VM_USER}"
 else
   log_warn "could not create per-user swtpm_setup config — manufacturing below may fall back to the packaged local CA and fail; the socket does not depend on it"
 fi
@@ -133,7 +133,7 @@ for inst in "${INSTANCES[@]}"; do
   if as_lab_user swtpm_setup --tpm2 --tpmstate "${state_dir}" \
       --createek --create-ek-cert --create-platform-cert --lock-nvram; then
     touch "${marker}"
-    chown "${LAB_USER}:${LAB_USER}" "${marker}"
+    chown "${VM_USER}:${VM_USER}" "${marker}"
     log_ok "swtpm_setup completed for '${inst}'"
   else
     log_warn "swtpm_setup failed for '${inst}' — continuing, because --flags not-need-init,startup-clear lets swtpm create default state on its own. The EK is then created on first use, without an EK certificate; enrolment does not need the certificate."
@@ -164,7 +164,7 @@ done
 
 log_step "Verify Part 2"
 
-# AppArmor confines swtpm on Ubuntu. State under $LAB_DIR is inside the
+# AppArmor confines swtpm on Ubuntu. State under $VM_DIR is inside the
 # profile's `owner @{HOME}/**` rule so the default policy already permits it,
 # but a customised STATE_ROOT or a tightened local profile can still trip a
 # denial. That denial never appears in the unit's own journal — only in the

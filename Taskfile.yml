@@ -5,21 +5,22 @@ version: '3'
 dotenv: ['.env']
 
 vars:
-  # VM
-  NAME: tpm-lab
+  # VM. Every value here can be overridden by the same name in .env; see
+  # .env.template.
+  NAME: '{{.VM_NAME | default "tpm-lab"}}'
   UBUNTU: "24.04"
   CPUS: "2"
   MEMORY: 4G
   DISK: 20G
 
   # Lab identity
-  DEVICE_NAME: node01
-  DOMAIN: devices.lab.local
+  DEVICE_NAME: '{{.DEVICE_NAME | default "node01"}}'
+  DOMAIN: '{{.DOMAIN | default "devices.lab.local"}}'
 
   # Two software TPMs run in the VM: the device TPM, and a second one standing
   # in for a different machine during the Part 8 demos. Each serves a unix
   # socket inside its state directory; see scripts/lib/common.sh for the paths.
-  LAB_DIR: /home/ubuntu/lab
+  VM_DIR: /home/ubuntu/lab
 
   # Host-side scratch. Everything transient this project writes on the Mac goes
   # here, never /tmp — it is gitignored and removed by `task clean:tmp`.
@@ -141,6 +142,8 @@ tasks:
     preconditions:
       - sh: test -f '{{.VAULT_BIN}}'
         msg: "Vault Enterprise binary not found at {{.VAULT_BIN}} — copy the private beta binary into .bin/ (gitignored) and re-run"
+      - sh: test -f '{{.VAULT_LICENSE}}'
+        msg: "Vault Enterprise licence not found at {{.VAULT_LICENSE}} — the server will not start without it; copy it into .bin/ (gitignored) and re-run"
     cmds:
       # The binary is pushed here, not in _sync: it is ~550 MB and only changes
       # when a new build lands in .bin/, so it must not ride along on every step.
@@ -164,7 +167,7 @@ tasks:
     desc: 'Parts 4-5: tpm auth method and its CA, KV secret, policy, device group and role, orchestrator token'
     cmds:
       - task: _run
-        vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}}'}
+        vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}} {{.DEVICE_NAME}}'}
 
   enrol:
     desc: 'Part 6: register the device TPM with Vault and attest it for a certificate'

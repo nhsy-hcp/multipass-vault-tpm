@@ -14,18 +14,17 @@ source "${STAGE_DIR}/common.sh"
 DEVICE="${1:-node01}"
 DOMAIN="${2:-devices.lab.local}"
 CN="${DEVICE}.${DOMAIN}"
-STATE_DIR="${LAB_TPM_DIR}/${DEVICE}"
+DEVICE_DIR="${TPM_DIR}/${DEVICE}"
 ROGUE_MOUNT="tpm-rogue"
-ROGUE_STATE="${LAB_TPM_DIR}/rogue"
-NO_TOKEN="device-holds-no-token"
+ROGUE_STATE="${TPM_DIR}/rogue"
 
 log_step "Part 8.3: a certificate from a CA this mount does not trust"
 
-[[ -s "${STATE_DIR}/tpm_id" ]] || die "no enrolment for ${DEVICE} at ${STATE_DIR}; run 'task enrol' first"
+[[ -s "${DEVICE_DIR}/tpm_id" ]] || die "no enrolment for ${DEVICE} at ${DEVICE_DIR}; run 'task enrol' first"
 [[ -S "${TPM_SOCK}" ]] || die "no TPM socket at ${TPM_SOCK} — run 'task tpm' first"
 require_cmd jq openssl || die "missing prerequisites"
-tpm_id="$(<"${STATE_DIR}/tpm_id")"
-lab_mkdir "${LAB_TPM_DIR}" "${ROGUE_STATE}"
+tpm_id="$(<"${DEVICE_DIR}/tpm_id")"
+lab_mkdir "${TPM_DIR}" "${ROGUE_STATE}"
 
 log_info "A second tpm auth mount stands in for an unrelated CA. Same Vault, same"
 log_info "TPM, same registered EK — but a different mount, so a different internal CA."
@@ -33,7 +32,7 @@ log_info ""
 
 # Operator work, so root is appropriate: this is a stand-in for a second,
 # unrelated certificate authority that happens to also trust this TPM.
-if as_lab_user vault auth list -format=json | jq -e --arg p "${ROGUE_MOUNT}/" 'has($p)' >/dev/null 2>&1; then
+if mount_enabled auth "${ROGUE_MOUNT}/"; then
   log_detected "the ${ROGUE_MOUNT} mount already enabled" "reusing it"
 else
   as_lab_user vault auth enable -path="${ROGUE_MOUNT}" tpm >/dev/null
@@ -44,30 +43,18 @@ as_lab_user vault write "auth/${ROGUE_MOUNT}/role/devices" tpm_ids="${tpm_id}" t
 log_ok "auth/${ROGUE_MOUNT}/role/devices trusts ${tpm_id:0:20}…"
 
 log_step "Attesting the device TPM against auth/${ROGUE_MOUNT} (a real attestation)"
-attempt=0
-while :; do
-  attempt=$(( attempt + 1 ))
-  flush_tpm_contexts
-  rc=0
-  out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
-    vault tpm attest -role-name=devices -mount-path="auth/${ROGUE_MOUNT}" \
-      -tpm-device-path="${TPM_SOCK}" -tpm-state-dir="${ROGUE_STATE}" \
-      -cert-subject-CN="${CN}" 2>&1)" || rc=$?
-  if (( rc == 0 )); then break; fi
-  if printf '%s' "${out}" | grep -qi 'rate limit' && (( attempt < 4 )); then
-    log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying"
-    sleep 12
-  else
-    printf '%s\n' "${out}" >&2
-    die "attestation against ${ROGUE_MOUNT} failed (rc=${rc}) — the demo needs a rogue-CA certificate to present"
-  fi
-done
+rc=0
+out="$(tpm_attest "${TPM_SOCK}" "${ROGUE_STATE}" devices "${CN}" "${ROGUE_MOUNT}")" || rc=$?
+if (( rc != 0 )); then
+  printf '%s\n' "${out}" >&2
+  die "attestation against ${ROGUE_MOUNT} failed (rc=${rc}) — the demo needs a rogue-CA certificate to present"
+fi
 log_ok "$(printf '%s\n' "${out}" | grep -m1 -v '^[[:space:]]*$')"
 
 log_info ""
 log_detail "  rogue cert issuer:  $(as_lab_user openssl x509 -in "${ROGUE_STATE}/client.crt" -noout -issuer | sed 's/^issuer=//')"
 log_detail "  rogue CA serial:    $(as_lab_user openssl x509 -in "${ROGUE_STATE}/ca_chain.pem" -noout -serial | sed 's/^serial=//')"
-log_detail "  trusted CA serial:  $(as_lab_user openssl x509 -in "${STATE_DIR}/ca_chain.pem" -noout -serial | sed 's/^serial=//')"
+log_detail "  trusted CA serial:  $(as_lab_user openssl x509 -in "${DEVICE_DIR}/ca_chain.pem" -noout -serial | sed 's/^serial=//')"
 log_detail "  Same issuer name, different CA key: the names match, the chain does not."
 log_info ""
 

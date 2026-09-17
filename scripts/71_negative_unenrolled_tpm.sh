@@ -13,14 +13,13 @@ source "${STAGE_DIR}/common.sh"
 
 DEVICE="${1:-node01}"
 DOMAIN="${2:-devices.lab.local}"
-ATT_STATE="${LAB_TPM_DIR}/attacker"
-NO_TOKEN="device-holds-no-token"
+ATT_STATE="${TPM_DIR}/attacker"
 
 log_step "Part 8.2: an unregistered TPM is refused at attestation"
 
 [[ -S "${ATTACKER_TPM_SOCK}" ]] || die "no attacker TPM at ${ATTACKER_TPM_SOCK} — run 'task tpm' first"
 require_cmd jq || die "missing prerequisites"
-lab_mkdir "${LAB_TPM_DIR}" "${ATT_STATE}"
+lab_mkdir "${TPM_DIR}" "${ATT_STATE}"
 
 log_info "The attacker owns a perfectly good TPM — the second swtpm — and asks Vault"
 log_info "for a certificate in the '${DEVICE}' role, exactly as the device did in Part 6."
@@ -49,13 +48,8 @@ report_expect "identity/tpm/id/${att_id:0:20}…: not found" "${reg_state}"
 
 log_step "Attempting attestation from the unregistered TPM (no token, as in Part 6)"
 log_detail "  vault tpm attest -role-name=devices -tpm-device-path=${ATTACKER_TPM_SOCK}"
-flush_tpm_contexts "${ATTACKER_TPM_SOCK}"
 rc=0
-out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
-  vault tpm attest -role-name=devices \
-    -tpm-device-path="${ATTACKER_TPM_SOCK}" \
-    -tpm-state-dir="${ATT_STATE}" \
-    -cert-subject-CN="${DEVICE}.${DOMAIN}" 2>&1)" || rc=$?
+out="$(tpm_attest "${ATTACKER_TPM_SOCK}" "${ATT_STATE}" devices "${DEVICE}.${DOMAIN}")" || rc=$?
 
 if (( rc == 0 )); then
   log_error "a certificate WAS issued to an unregistered TPM"

@@ -26,9 +26,7 @@ source "${STAGE_DIR}/common.sh"
 # so the negative-test scripts can show the operator *why* a login failed.
 # -----------------------------------------------------------------------------
 
-LOGIN_JSON="${LAB_STATE_DIR}/login.json"
-# See scripts/40_enrol_device.sh for why a placeholder rather than root/empty.
-NO_TOKEN="device-holds-no-token"
+LOGIN_JSON="${STATE_DIR}/login.json"
 
 usage() {
   cat <<'USAGE'
@@ -78,7 +76,7 @@ while (( $# > 0 )); do
   esac
 done
 
-[[ -n "${state_dir}" ]] || state_dir="${LAB_TPM_DIR}/${device}"
+[[ -n "${state_dir}" ]] || state_dir="${TPM_DIR}/${device}"
 
 # Narration is suppressed wholesale by --quiet-json so that stdout stays
 # machine-readable.
@@ -144,7 +142,7 @@ if [[ -z "${token}" ]]; then
 fi
 
 if (( no_save == 0 )); then
-  install -o "${LAB_USER}" -g "${LAB_USER}" -m 0600 "${tmp_json}" "${LOGIN_JSON}"
+  install -o "${VM_USER}" -g "${VM_USER}" -m 0600 "${tmp_json}" "${LOGIN_JSON}"
 fi
 
 if (( quiet_json )); then
@@ -161,10 +159,10 @@ meta_serial="$(jq -r '.auth.metadata.serial_number // "(none)"' "${tmp_json}")"
 
 say ''
 say_ok "token issued: ${token:0:12}… (ttl ${ttl}s, policies: ${policies})"
-say_detail "  Vault recorded who this is, straight from the certificate it verified:"
-say_detail "    tpm_id       ${meta_tpm}"
+say_detail "  Token metadata, from the certificate Vault verified:"
+say_detail "    tpm_id       ${meta_tpm}   ← the identity Vault enforced: this TPM is in the role's group"
 say_detail "    role_name    ${meta_role}"
-say_detail "    common_name  ${meta_cn}"
+say_detail "    common_name  ${meta_cn}   ← self-asserted at attestation; not checked by anything"
 say_detail "    serial       ${meta_serial}"
 if (( no_save == 0 )); then
   say_detail "  saved to       ${LOGIN_JSON}"

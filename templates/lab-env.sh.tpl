@@ -4,12 +4,12 @@
 # VM, so the authoritative content is the heredoc in scripts/00_provision.sh.
 # Keep the two in sync.
 #
-# Rendered to ${LAB_DIR}/env.sh. Every lab shell sources this file, and
+# Rendered to ${VM_DIR}/env.sh. Every lab shell sources this file, and
 # as_lab_user() in scripts/lib/common.sh sources it too, so a `multipass shell`
 # session and an automated step see exactly the same environment.
 
-export LAB_DIR="${LAB_DIR}"
-export LAB_TPM_DIR="${LAB_TPM_DIR}"
+export VM_DIR="${VM_DIR}"
+export TPM_DIR="${TPM_DIR}"
 
 # TPM connection. Each software TPM serves a unix socket, and tpm2-tools and
 # the Vault CLI reach the same TPM through the same path. On real hardware this
@@ -27,5 +27,5 @@ export ATTACKER_TPM_DEVICE_PATH="${ATTACKER_TPM_SOCK}"
 # Vault dev server with TLS. The dev certificate is issued for 127.0.0.1 only,
 # which is why client and server both live inside the VM.
 export VAULT_ADDR="https://127.0.0.1:8200"
-export VAULT_CACERT="${LAB_TLS_DIR}/vault-ca.pem"
+export VAULT_CACERT="${TLS_DIR}/vault-ca.pem"
 export VAULT_TOKEN="root"

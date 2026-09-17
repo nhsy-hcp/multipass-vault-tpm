@@ -4,20 +4,20 @@
 # shellcheck shell=bash
 
 # Lab layout inside the VM. Overridable for testing.
-LAB_USER="${LAB_USER:-ubuntu}"
-LAB_DIR="${LAB_DIR:-/home/${LAB_USER}/lab}"
-LAB_STATE_DIR="${LAB_STATE_DIR:-${LAB_DIR}/state}"
-LAB_TLS_DIR="${LAB_TLS_DIR:-${LAB_DIR}/vault-tls}"
+VM_USER="${VM_USER:-ubuntu}"
+VM_DIR="${VM_DIR:-/home/${VM_USER}/lab}"
+STATE_DIR="${STATE_DIR:-${VM_DIR}/state}"
+TLS_DIR="${TLS_DIR:-${VM_DIR}/vault-tls}"
 # Where `vault tpm attest` keeps each device's certificate and key blobs.
-LAB_TPM_DIR="${LAB_TPM_DIR:-${LAB_DIR}/tpm}"
-export LAB_USER LAB_DIR LAB_STATE_DIR LAB_TLS_DIR LAB_TPM_DIR
+TPM_DIR="${TPM_DIR:-${VM_DIR}/tpm}"
+export VM_USER VM_DIR STATE_DIR TLS_DIR TPM_DIR
 
 # Software TPMs. Each swtpm instance serves a unix socket inside its own state
 # directory, and tpm2-tools, OpenSSL and the Vault CLI all reach the TPM through
 # that one path — on real hardware it becomes /dev/tpmrm0 and nothing else
 # changes. The attacker TPM stands in for a different machine: same software,
 # different storage seed.
-TPM_STATE_ROOT="${TPM_STATE_ROOT:-${LAB_DIR}/tpmstate}"
+TPM_STATE_ROOT="${TPM_STATE_ROOT:-${VM_DIR}/tpmstate}"
 TPM_SOCK="${TPM_SOCK:-${TPM_STATE_ROOT}/device/swtpm.sock}"
 ATTACKER_TPM_SOCK="${ATTACKER_TPM_SOCK:-${TPM_STATE_ROOT}/attacker/swtpm.sock}"
 export TPM_STATE_ROOT TPM_SOCK ATTACKER_TPM_SOCK
@@ -30,8 +30,8 @@ export TPM_STATE_ROOT TPM_SOCK ATTACKER_TPM_SOCK
 # where the Taskfile drops the scripts and is the only place they should write
 # scratch files — namespaced so the lab cannot collide with anything else.
 VM_STAGE="${VM_STAGE:-/tmp/tpm-lab}"
-LAB_TMP="${LAB_TMP:-${VM_STAGE}/scratch}"
-export VM_STAGE LAB_TMP
+SCRATCH_DIR="${SCRATCH_DIR:-${VM_STAGE}/scratch}"
+export VM_STAGE SCRATCH_DIR
 
 # Point mktemp and anything else honouring TMPDIR at the lab's own scratch dir,
 # so nothing this project runs leaves files loose in the system temp directory.
@@ -42,12 +42,12 @@ export VM_STAGE LAB_TMP
 # fails with "Permission denied". Root can still write to a 0700 directory it
 # does not own. Guarded so host-side scripts, where the lab user does not
 # exist, are unaffected.
-mkdir -p "${LAB_TMP}" 2>/dev/null || true
-if [[ ${EUID} -eq 0 ]] && id -u "${LAB_USER}" >/dev/null 2>&1; then
-  chown "${LAB_USER}:${LAB_USER}" "${LAB_TMP}" 2>/dev/null || true
-  chmod 0700 "${LAB_TMP}" 2>/dev/null || true
+mkdir -p "${SCRATCH_DIR}" 2>/dev/null || true
+if [[ ${EUID} -eq 0 ]] && id -u "${VM_USER}" >/dev/null 2>&1; then
+  chown "${VM_USER}:${VM_USER}" "${SCRATCH_DIR}" 2>/dev/null || true
+  chmod 0700 "${SCRATCH_DIR}" 2>/dev/null || true
 fi
-TMPDIR="${LAB_TMP}"
+TMPDIR="${SCRATCH_DIR}"
 export TMPDIR
 
 # --- output -----------------------------------------------------------------
@@ -160,7 +160,7 @@ wait_for_unit() {
 as_lab_user() {
   local cmd
   cmd="$(printf '%q ' "$@")"
-  runuser -u "${LAB_USER}" -- bash -lc "set -euo pipefail; source '${LAB_DIR}/env.sh'; ${cmd}"
+  runuser -u "${VM_USER}" -- bash -lc "set -euo pipefail; source '${VM_DIR}/env.sh'; ${cmd}"
 }
 
 # Same, but tolerates failure and returns the exit status to the caller.
@@ -172,7 +172,7 @@ as_lab_user_allow_fail() {
 }
 
 lab_mkdir() {
-  install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0755 "$@"
+  install -d -o "${VM_USER}" -g "${VM_USER}" -m 0755 "$@"
 }
 
 # Write stdin to a lab-owned file. Vault CLI output is captured by root, so
@@ -181,7 +181,7 @@ write_lab_file() {
   local dest="$1" mode="${2:-0644}" tmp
   tmp="$(mktemp)"
   cat > "${tmp}"
-  install -o "${LAB_USER}" -g "${LAB_USER}" -m "${mode}" "${tmp}" "${dest}"
+  install -o "${VM_USER}" -g "${VM_USER}" -m "${mode}" "${tmp}" "${dest}"
   rm -f "${tmp}"
 }
 
@@ -200,6 +200,53 @@ flush_tpm_contexts() {
     tpm2_flushcontext -t >/dev/null 2>&1 || true
   as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
     tpm2_flushcontext -l >/dev/null 2>&1 || true
+}
+
+# --- the device side of Vault ------------------------------------------------
+# The attestation and login endpoints are unauthenticated, so Vault ignores
+# whatever token the CLI attaches — but leaving VAULT_TOKEN alone would put
+# 'root' on the wire during the very steps that are meant to prove the device
+# holds no credential, and an empty value is worse: the CLI falls back to the
+# ~/.vault-token helper file, which the dev server populates with the root
+# token. A deliberate placeholder keeps the demo honest.
+NO_TOKEN="device-holds-no-token"
+export NO_TOKEN
+
+# tpm_attest <socket> <state-dir> <role> <cn> [mount]
+#
+# Runs `vault tpm attest` as the lab user with no token, flushing transient
+# contexts first. Vault rate-limits attestation per EK (about ten seconds in
+# this beta), so a rate-limit refusal is retried after a wait; any other
+# outcome is returned as-is. Prints the CLI's output; returns its exit status.
+tpm_attest() {
+  local sock="$1" state_dir="$2" role="$3" cn="$4" mount="${5:-tpm}"
+  local attempt=0 rc out
+  while :; do
+    attempt=$(( attempt + 1 ))
+    flush_tpm_contexts "${sock}"
+    rc=0
+    out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
+      vault tpm attest \
+        -role-name="${role}" \
+        -mount-path="auth/${mount}" \
+        -tpm-device-path="${sock}" \
+        -tpm-state-dir="${state_dir}" \
+        -cert-subject-CN="${cn}" 2>&1)" || rc=$?
+    if (( rc != 0 )) && (( attempt < 4 )) && printf '%s' "${out}" | grep -qi 'rate limit'; then
+      log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying (attempt ${attempt})" >&2
+      sleep 12
+      continue
+    fi
+    printf '%s\n' "${out}"
+    return "${rc}"
+  done
+}
+
+# True when the named mount is already present at the given path ("tpm/").
+mount_enabled() {
+  local kind="$1" path="$2"
+  as_lab_user vault "${kind}" list -format=json 2>/dev/null \
+    | jq -e --arg p "${path}" 'has($p)' >/dev/null 2>&1
 }
 
 # --- misc -------------------------------------------------------------------

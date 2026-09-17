@@ -28,7 +28,7 @@ source "${STAGE_DIR}/common.sh"
 device="${1:-}"
 [[ -n "${device}" ]] || die "usage: 60_privilege.sh <device-name>"
 
-LOGIN_JSON="${LAB_STATE_DIR}/login.json"
+LOGIN_JSON="${STATE_DIR}/login.json"
 SECRET_PATH="secret/devices/${device}"
 
 require_cmd jq runuser || die "missing prerequisites"

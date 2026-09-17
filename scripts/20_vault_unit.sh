@@ -15,17 +15,17 @@ log_step "Part 3: start the Vault dev server (TLS)"
 UNIT_PATH="/etc/systemd/system/vault-dev.service"
 
 VAULT_BIN="/usr/local/bin/vault"
-LICENCE_PATH="${LAB_DIR}/vault.hclic"
+LICENCE_PATH="${VM_DIR}/vault.hclic"
 
 require_cmd systemctl || die "systemctl not found"
 [[ -x "${VAULT_BIN}" ]] || die "${VAULT_BIN} is missing — run 'task provision' first"
-[[ -f "${LAB_DIR}/env.sh" ]] || die "${LAB_DIR}/env.sh is missing — run 'task provision' first"
+[[ -f "${VM_DIR}/env.sh" ]] || die "${VM_DIR}/env.sh is missing — run 'task provision' first"
 [[ -s "${LICENCE_PATH}" ]] \
   || log_warn "no licence at ${LICENCE_PATH} — Vault Enterprise will refuse to start; copy it to .bin/vault.hclic on the host and re-run 'task provision'"
 
 # The dev server writes its self-signed certificate material here on every
 # start, so the directory must exist and be writable by the lab user.
-lab_mkdir "${LAB_DIR}" "${LAB_TLS_DIR}"
+lab_mkdir "${VM_DIR}" "${TLS_DIR}"
 
 # The HashiCorp package ships its own vault.service for a production server.
 # It would bind the same 127.0.0.1:8200 and fight this unit for the port.
@@ -57,11 +57,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=${LAB_USER}
-Group=${LAB_USER}
-WorkingDirectory=${LAB_DIR}
+User=${VM_USER}
+Group=${VM_USER}
+WorkingDirectory=${VM_DIR}
 Environment=VAULT_LICENSE_PATH=${LICENCE_PATH}
-ExecStart=${VAULT_BIN} server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
+ExecStart=${VAULT_BIN} server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${TLS_DIR}
 Restart=on-failure
 RestartSec=2
 
@@ -103,11 +103,11 @@ fi
 wait_for "Vault to report unsealed" 60 as_lab_user vault status \
   || die "Vault never reported unsealed — inspect with: journalctl -u vault-dev --no-pager -n 50"
 
-log_info "Contents of ${LAB_TLS_DIR} (expect vault-ca.pem, vault-cert.pem, vault-key.pem):"
-ls -1 "${LAB_TLS_DIR}" | sed 's/^/  /'
+log_info "Contents of ${TLS_DIR} (expect vault-ca.pem, vault-cert.pem, vault-key.pem):"
+ls -1 "${TLS_DIR}" | sed 's/^/  /'
 
 for f in vault-ca.pem vault-cert.pem vault-key.pem; do
-  [[ -s "${LAB_TLS_DIR}/${f}" ]] || log_warn "missing or empty: ${LAB_TLS_DIR}/${f}"
+  [[ -s "${TLS_DIR}/${f}" ]] || log_warn "missing or empty: ${TLS_DIR}/${f}"
 done
 
 log_info "vault status (expect 'Sealed false' and 'Storage Type inmem'):"

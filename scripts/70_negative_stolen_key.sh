@@ -10,13 +10,13 @@ STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${STAGE_DIR}/common.sh"
 
 DEVICE="${1:-node01}"
-STATE_DIR="${LAB_TPM_DIR}/${DEVICE}"
-STOLEN_DIR="${LAB_TPM_DIR}/stolen"
+DEVICE_DIR="${TPM_DIR}/${DEVICE}"
+STOLEN_DIR="${TPM_DIR}/stolen"
 
 log_step "Part 8.1: stolen key blobs against a different TPM"
 
-[[ -s "${STATE_DIR}/client.crt" && -s "${STATE_DIR}/app.blob" ]] \
-  || die "no attested state for ${DEVICE} at ${STATE_DIR}; run 'task enrol' first"
+[[ -s "${DEVICE_DIR}/client.crt" && -s "${DEVICE_DIR}/app.blob" ]] \
+  || die "no attested state for ${DEVICE} at ${DEVICE_DIR}; run 'task enrol' first"
 [[ -S "${ATTACKER_TPM_SOCK}" ]] || die "no attacker TPM at ${ATTACKER_TPM_SOCK} — run 'task tpm' first"
 
 log_info "The attacker has copied the whole state directory off the device:"
@@ -29,7 +29,7 @@ log_info "seed, which the lab models as a second swtpm at ${ATTACKER_TPM_SOCK}."
 log_info ""
 
 rm -rf "${STOLEN_DIR}"
-as_lab_user cp -a "${STATE_DIR}" "${STOLEN_DIR}"
+as_lab_user cp -a "${DEVICE_DIR}" "${STOLEN_DIR}"
 log_ok "copied to ${STOLEN_DIR} — byte for byte the same files"
 
 log_step "Attempting login with the copied files against the attacker TPM"

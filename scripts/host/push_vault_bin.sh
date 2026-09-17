@@ -12,7 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-export LAB_TMP="${PROJECT_ROOT}/.tmp"
+export SCRATCH_DIR="${PROJECT_ROOT}/.tmp"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
 
@@ -24,7 +24,7 @@ VAULT_LICENSE="${4:-}"
 # Where 00_provision.sh installs each file. Kept here so the skip check can
 # compare against the installed copy, not just the staged one.
 VAULT_INSTALLED="/usr/local/bin/vault"
-LICENCE_INSTALLED="${LAB_DIR}/vault.hclic"
+LICENCE_INSTALLED="${VM_DIR}/vault.hclic"
 
 log_step "Vault Enterprise binary → ${VM_NAME}"
 
@@ -46,6 +46,9 @@ push_if_changed() {
 
   if [[ "$(vm_sha "${installed}")" == "${want}" ]]; then
     log_detected "${installed} already matches ${src}" "skipping the transfer"
+    # A staged copy left by an interrupted earlier run could differ from both;
+    # 00_provision.sh would install it in preference to the good installed one.
+    multipass exec "${VM_NAME}" -- rm -f "${staged}"
     return 0
   fi
   if [[ "$(vm_sha "${staged}")" == "${want}" ]]; then

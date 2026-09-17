@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Host scratch lives in the project, per the project convention. Create it here
 # so anything running later can rely on it existing.
-export LAB_TMP="${PROJECT_ROOT}/.tmp"
+export SCRATCH_DIR="${PROJECT_ROOT}/.tmp"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
 
@@ -48,15 +48,19 @@ multipass version | sed 's/^/  /'
 log_step "Vault Enterprise binary"
 VAULT_BIN="${1:-.bin/vault_2.2.0-beta1+ent_linux_arm64}"
 VAULT_LICENSE="${2:-.bin/vault.hclic}"
-if [[ -f "${PROJECT_ROOT}/${VAULT_BIN}" ]]; then
-  log_ok "${VAULT_BIN}"
+# Paths from .env may be absolute; relative ones are project-rooted, as in the
+# Taskfile.
+[[ "${VAULT_BIN}" == /* ]]     || VAULT_BIN="${PROJECT_ROOT}/${VAULT_BIN}"
+[[ "${VAULT_LICENSE}" == /* ]] || VAULT_LICENSE="${PROJECT_ROOT}/${VAULT_LICENSE}"
+if [[ -f "${VAULT_BIN}" ]]; then
+  log_ok "${VAULT_BIN#"${PROJECT_ROOT}/"}"
 else
-  log_warn "${VAULT_BIN} not found — copy the private beta binary into .bin/ before 'task provision'"
+  log_warn "${VAULT_BIN#"${PROJECT_ROOT}/"} not found — copy the private beta binary into .bin/ before 'task provision'"
 fi
-if [[ -f "${PROJECT_ROOT}/${VAULT_LICENSE}" ]]; then
-  log_ok "${VAULT_LICENSE}"
+if [[ -f "${VAULT_LICENSE}" ]]; then
+  log_ok "${VAULT_LICENSE#"${PROJECT_ROOT}/"}"
 else
-  log_warn "${VAULT_LICENSE} not found — Vault Enterprise will not start without a licence"
+  log_warn "${VAULT_LICENSE#"${PROJECT_ROOT}/"} not found — Vault Enterprise will not start without a licence"
 fi
 
 log_info ''

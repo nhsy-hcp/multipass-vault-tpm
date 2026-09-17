@@ -14,7 +14,7 @@ STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${STAGE_DIR}/common.sh"
 
 DEVICE="${1:-node01}"
-LOGIN_JSON="${LAB_STATE_DIR}/login.json"
+LOGIN_JSON="${STATE_DIR}/login.json"
 
 log_step "Part 8.5: revoking the device token"
 
