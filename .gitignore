@@ -2,6 +2,9 @@
 .plans/
 .tmp/
 
+# private beta binaries and licence copied into the VM, never committed
+.bin/
+
 # go-task checksum cache
 .task/
 
@@ -18,6 +21,7 @@
 *.key
 *.serial
 *.tpmkey
+*.hclic
 
 # logs
 logs/
