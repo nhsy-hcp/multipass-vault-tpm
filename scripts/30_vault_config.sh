@@ -1,7 +1,9 @@
 #!/bin/bash
-# Parts 4-5: build the device CA, then the secret, policy and cert auth role.
-# Runs as root inside the VM; every vault/openssl call is delegated to the lab
-# user so the artefacts it leaves behind are usable from an interactive shell.
+# Parts 4-5: enable the tpm auth method with its internal CA, then the demo
+# secret, the least-privilege policy, the device group and role, and the
+# orchestrator credential that enrols devices.
+# Runs as root inside the VM; every vault call is delegated to the lab user so
+# the artefacts it leaves behind are usable from an interactive shell.
 set -euo pipefail
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
@@ -13,101 +15,66 @@ DOMAIN="${1:-devices.lab.local}"
 # so enrolling a second device needs no change here.
 DEMO_DEVICE="node01"
 
-CA_PEM="${LAB_PKI_DIR}/lab_device_ca.pem"
 SENTINEL="${LAB_STATE_DIR}/config.json"
 
-# The provisioning orchestrator: the identity that mints enrolment credentials.
-# Scoped to exactly that, and created here because issuing it is part of the same
+# Vault Enterprise's tpm auth method. It carries its own CA: device certificates
+# are issued by the mount itself at the end of an EK/AK attestation, so there is
+# no PKI secrets engine and no CSR signing anywhere in this lab.
+TPM_MOUNT="tpm"
+TPM_GROUP="devices"
+TPM_ROLE="devices"
+
+# The provisioning orchestrator: the identity that registers a device's
+# endorsement key and admits it to the group the role trusts. Scoped to exactly
+# that, and created here because issuing it is part of the same
 # trust-establishing job as everything else in Parts 4-5. See Part 5.5 below.
 ORCH_POLICY="enrol-orchestrator"
 ORCH_TOKEN_FILE="${LAB_STATE_DIR}/orchestrator.token"
 
-# Vault CLI output is captured as root, so ownership has to be applied on the
-# way to disk rather than relying on the creating process.
-write_lab_file() {
-  local dest="$1" mode="${2:-0644}" tmp
-  tmp="$(mktemp)"
-  cat > "${tmp}"
-  install -o "${LAB_USER}" -g "${LAB_USER}" -m "${mode}" "${tmp}" "${dest}"
-  rm -f "${tmp}"
-}
-
-# True when the named mount is already present at the given path ("pki/").
+# True when the named mount is already present at the given path ("tpm/").
 mount_enabled() {
   local kind="$1" path="$2"
   as_lab_user vault "${kind}" list -format=json 2>/dev/null \
     | jq -e --arg p "${path}" 'has($p)' >/dev/null 2>&1
 }
 
-log_step "Parts 4-5: device CA, demo secret, policy and cert auth"
+log_step "Parts 4-5: tpm auth method, demo secret, policy, device group and role"
 
 require_cmd jq install || die "missing tooling — run 'task provision' first"
 [[ -f "${LAB_DIR}/env.sh" ]] || die "no ${LAB_DIR}/env.sh — run 'task provision' first"
 
-lab_mkdir "${LAB_PKI_DIR}" "${LAB_STATE_DIR}"
+lab_mkdir "${LAB_STATE_DIR}"
 
 # Vault dev mode is in-memory: a restart wipes every mount configured below.
 # Waiting here makes this script safe to run immediately after 'task vault'.
 wait_for "Vault to be unsealed" 60 as_lab_user vault status \
   || die "Vault is not responding — check 'task logs:vault'"
 
-vault_addr="$(as_lab_user printenv VAULT_ADDR)"
-[[ -n "${vault_addr}" ]] || die "VAULT_ADDR is not exported by ${LAB_DIR}/env.sh"
+vault_ver="$(as_lab_user vault version)"
+[[ "${vault_ver}" == *"+ent"* ]] \
+  || die "the tpm auth method is Vault Enterprise only, and this is not an Enterprise build: ${vault_ver}"
 
-# --- Part 4: the device CA --------------------------------------------------
-log_step "Part 4: device CA on the pki secrets engine"
+# --- Part 4: the tpm auth method and its internal CA -------------------------
+log_step "Part 4: enable the tpm auth method (its CA issues the device certificates)"
 
-if mount_enabled secrets "pki/"; then
-  log_detected "the pki secrets engine already mounted" "skipping enable"
+if mount_enabled auth "${TPM_MOUNT}/"; then
+  log_detected "the tpm auth method already enabled at auth/${TPM_MOUNT}" "skipping enable"
 else
-  log_info "Enabling the pki secrets engine"
-  as_lab_user vault secrets enable pki
+  log_info "Enabling the tpm auth method at auth/${TPM_MOUNT}"
+  as_lab_user vault auth enable -path="${TPM_MOUNT}" tpm
 fi
 
-# Tuning is an upsert, so it is always safe to re-apply.
-log_info "Tuning pki max lease TTL to 87600h (10 years)"
-as_lab_user vault secrets tune -max-lease-ttl=87600h pki
+# The mount keeps an active CA and a pre-generated next CA and rotates between
+# them on its own. Nothing here is exported or trusted by hand: a certificate
+# is valid because this mount issued it, and only this mount can. Device
+# certificates default to 24h — re-running 'task enrol' refreshes them.
+log_info "Configuring the internal CA (device certificates live 24h)"
+as_lab_user vault write "auth/${TPM_MOUNT}/config" default_cert_ttl=24h
 
-# Generating a root twice either errors or silently leaves a second root on the
-# mount, so generation is gated on whether the mount already has one.
-if as_lab_user vault read pki/cert/ca >/dev/null 2>&1; then
-  log_detected "an existing root CA on the pki mount" "skipping generation"
-  if [[ ! -s "${CA_PEM}" ]]; then
-    # State can drift: the mount survives while the PEM is lost (e.g. after a
-    # 'task reset' that clears the lab dir). Re-fetch rather than regenerate.
-    log_info "Re-fetching the CA certificate to ${CA_PEM}"
-    as_lab_user vault read -field=certificate pki/cert/ca | write_lab_file "${CA_PEM}"
-  fi
-else
-  log_info "Generating root CA 'Lab Device Root CA' (ttl 87600h)"
-  as_lab_user vault write -field=certificate pki/root/generate/internal \
-    common_name="Lab Device Root CA" ttl=87600h | write_lab_file "${CA_PEM}"
-fi
-[[ -s "${CA_PEM}" ]] || die "device CA PEM is missing or empty: ${CA_PEM}"
-log_ok "device CA at ${CA_PEM}"
+log_step "Verify: auth/${TPM_MOUNT}/config"
+as_lab_user vault read "auth/${TPM_MOUNT}/config"
 
-log_info "Publishing issuing and CRL URLs"
-as_lab_user vault write pki/config/urls \
-  issuing_certificates="${vault_addr}/v1/pki/ca" \
-  crl_distribution_points="${vault_addr}/v1/pki/crl"
-
-log_info "Writing the 'devices' role for ${DOMAIN} (client certs only)"
-as_lab_user vault write pki/roles/devices \
-  allowed_domains="${DOMAIN}" \
-  allow_subdomains=true \
-  key_type=any \
-  client_flag=true \
-  server_flag=false \
-  max_ttl=720h
-
-log_step "Verify: the device CA certificate"
-as_lab_user openssl x509 -in "${CA_PEM}" -noout -subject -dates
-
-ca_serial="$(as_lab_user openssl x509 -in "${CA_PEM}" -noout -serial)"
-ca_serial="${ca_serial#serial=}"
-log_detail "CA serial: ${ca_serial}"
-
-# --- Part 5: secret, policy, cert auth --------------------------------------
+# --- Part 5: secret, policy, group, role, orchestrator ------------------------
 log_step "Part 5.1: the secret the device should be able to read"
 as_lab_user vault kv put "secret/devices/${DEMO_DEVICE}" \
   message="hello from vault, attested by TPM key"
@@ -121,128 +88,65 @@ path "secret/data/devices/*" {
 EOF
 log_ok "policy device-read written"
 
-log_step "Part 5.3: enable and configure cert auth"
-if mount_enabled auth "cert/"; then
-  log_detected "the cert auth method already enabled" "skipping enable"
+log_step "Part 5.3: the '${TPM_GROUP}' TPM group"
+# A role can trust individual TPM IDs or a group of them. The group is the
+# indirection that keeps enrolment least-privilege: admitting a device means
+# adding its TPM ID to this group, which the orchestrator may do, rather than
+# editing the auth role, which it may not — a role write could also change
+# token_policies, and that is an escalation path, not an enrolment.
+if as_lab_user vault read -format=json "identity/tpmgroup/name/${TPM_GROUP}" >/dev/null 2>&1; then
+  log_detected "an existing TPM group '${TPM_GROUP}'" "keeping its members"
 else
-  log_info "Enabling the cert auth method"
-  as_lab_user vault auth enable cert
+  log_info "Creating TPM group '${TPM_GROUP}' (empty until 'task enrol' adds a device)"
+  as_lab_user vault write "identity/tpmgroup" name="${TPM_GROUP}" metadata="domain=${DOMAIN}" >/dev/null
 fi
+group_id="$(as_lab_user vault read -field=id "identity/tpmgroup/name/${TPM_GROUP}")"
+[[ -n "${group_id}" ]] || die "could not read the id of TPM group '${TPM_GROUP}'"
+log_ok "group ${TPM_GROUP} = ${group_id}"
 
-# The trust anchor is the CA, not any individual device certificate: a device
-# enrolled later is trusted the moment Vault's PKI signs its CSR.
-log_info "Trusting the device CA for *.${DOMAIN} (15m token, 1h max)"
-as_lab_user vault write auth/cert/certs/tpm-devices \
+log_step "Part 5.4: the '${TPM_ROLE}' role (15m token, 1h max)"
+# The trust anchor is the group, not any individual TPM: a device enrolled
+# later is trusted the moment its TPM ID joins the group. 'vault write' is an
+# upsert, so re-running resets the role to the intended shape.
+as_lab_user vault write "auth/${TPM_MOUNT}/role/${TPM_ROLE}" \
+  tpmgroup_ids="${group_id}" \
   display_name=tpm-devices \
-  certificate=@"${CA_PEM}" \
-  allowed_common_names="*.${DOMAIN}" \
   token_policies=device-read \
   token_ttl=15m \
   token_max_ttl=1h
 
-log_step "Verify: the cert auth role"
-as_lab_user vault read auth/cert/certs/tpm-devices
+log_step "Verify: the tpm auth role"
+as_lab_user vault read "auth/${TPM_MOUNT}/role/${TPM_ROLE}"
 
-log_step "Part 5.4: one-shot AppRole for enrolment"
-# Enrolment is the one moment a device has no certificate yet, so it cannot use
-# cert auth to get the credential that signs its first CSR. Something has to
-# bootstrap it. Handing over the dev root token would mean the device holds
-# unlimited privilege — delete every mount, mint any certificate, read every
-# secret — purely to obtain a certificate it is already entitled to.
+log_step "Part 5.5: the orchestrator credential that enrols devices"
+# The device side of enrolment needs no Vault credential at all: the
+# attestation endpoints are unauthenticated, because possession of an
+# endorsement key that Vault already knows IS the credential. What remains
+# privileged is telling Vault which endorsement keys to know — registering an
+# EK and admitting it to the group. Doing that with the dev root token would
+# leave the operator side holding unlimited privilege in the very step whose
+# point is least privilege.
 #
-# 'device-enrol' is the smallest credential that can do the job and nothing
-# else: one capability on one path. It cannot read secrets, cannot alter the
-# cert auth trust anchor, and cannot issue against any other PKI role.
-if mount_enabled auth "approle/"; then
-  log_detected "the approle auth method already enabled" "skipping enable"
-else
-  log_info "Enabling the approle auth method"
-  as_lab_user vault auth enable approle
-fi
-
-log_info "Writing the 'device-enrol' policy (sign CSRs only)"
-# Deliberately a single stanza. 'update' on pki/sign/devices is what signing a
-# CSR requires; anything beyond that would widen the blast radius of a leaked
-# SecretID for no benefit to the demo.
-as_lab_user vault policy write device-enrol - <<'EOF'
-path "pki/sign/devices" {
+# So the provisioning system gets an identity of its own: three paths, and
+# nothing else. It cannot alter the auth role, read a secret, touch another
+# group, or mint tokens. The device-side attestation is what 'task enrol'
+# demonstrates; this is the other half.
+log_info "Writing the '${ORCH_POLICY}' policy (register EKs, admit them to '${TPM_GROUP}')"
+as_lab_user vault policy write "${ORCH_POLICY}" - <<EOF
+# Register a device's endorsement key. Vault derives the TPM ID from it.
+path "identity/tpm" {
   capabilities = ["update"]
 }
-EOF
-log_ok "policy device-enrol written"
 
-log_info "Creating the 'device-enrol' AppRole (single-use SecretID)"
-# 'vault write' is an upsert, so re-running this resets the role to the
-# intended shape rather than erroring — no guard needed.
-#
-# secret_id_num_uses=1 is the property on show: the credential is spent by the
-# first login and is worthless to anyone who copies it afterwards. Every later
-# authentication uses the TPM key and the certificate signed here, so this
-# credential is needed exactly once in a device's lifetime.
-#
-# token_num_uses=3 rather than 1 is deliberate. Signing the CSR is a single
-# request, but the enrolment script also looks the token up to narrate what it
-# was granted; a use-limit tripping mid-demo is a worse failure than a slightly
-# looser bound. The SecretID stays strictly single-use — that is the behaviour
-# being demonstrated, and the token is short-lived regardless.
-as_lab_user vault write auth/approle/role/device-enrol \
-  token_policies=device-enrol \
-  secret_id_num_uses=1 \
-  secret_id_ttl=10m \
-  token_ttl=5m \
-  token_max_ttl=10m \
-  token_num_uses=3
-
-log_step "Verify: the device-enrol AppRole"
-as_lab_user vault read auth/approle/role/device-enrol
-
-# The table above is long and the limits that matter are scattered through it,
-# so restate them as one line for the demo transcript.
-enrol_role_json="$(as_lab_user vault read -format=json auth/approle/role/device-enrol)"
-enrol_limits="$(printf '%s' "${enrol_role_json}" \
-  | jq -r '.data | "\(.secret_id_num_uses) \(.secret_id_ttl) \(.token_ttl) \(.token_max_ttl) \(.token_num_uses)"')"
-read -r sid_uses sid_ttl tok_ttl tok_max tok_uses <<<"${enrol_limits}"
-log_detail "SecretID: ${sid_uses} use(s), TTL ${sid_ttl}s"
-log_detail "Token:    TTL ${tok_ttl}s, max ${tok_max}s, ${tok_uses} uses"
-
-# The RoleID is the stable half of an AppRole credential and is not a secret —
-# it identifies the role, it does not authorise anything without a SecretID.
-# It is the part you would bake into an image, so showing it is useful.
-enrol_role_id="$(as_lab_user vault read -field=role_id auth/approle/role/device-enrol/role-id)"
-log_detail "RoleID:   ${enrol_role_id}"
-log_ok "AppRole device-enrol ready — SecretID is minted per enrolment, not here"
-
-log_step "Part 5.5: the orchestrator credential that mints enrolment SecretIDs"
-# Minting a SecretID is itself privileged: whoever can do it can obtain a device
-# certificate for any name the 'devices' role allows. Part 6 used to mint with
-# the dev root token, which left the operator side of enrolment holding unlimited
-# privilege in the very step whose point is least privilege on the device side.
-#
-# So the provisioning system gets an identity of its own: two paths, and nothing
-# else. It cannot sign a CSR, read a secret, alter the cert auth trust anchor or
-# mint credentials for any other role. Same idea as 'device-enrol' above, one
-# level up the chain — and the two together are what 'task enrol' demonstrates.
-log_info "Writing the '${ORCH_POLICY}' policy (mint enrolment SecretIDs only)"
-as_lab_user vault policy write "${ORCH_POLICY}" - <<'EOF'
-# Mint enrolment credentials for the device-enrol role. This is the whole job.
-#
-# min_wrapping_ttl is the interesting line. Response wrapping normally costs no
-# permission at all — Vault authorises the call against this path as usual and
-# wraps the reply afterwards — so an orchestrator with 'update' could equally
-# well mint a bare SecretID and hand it over in the clear. Setting a minimum
-# makes wrapping mandatory: an unwrapped mint against this path is denied.
-# Tamper-evidence stops being a convention the script happens to follow and
-# becomes something the policy enforces.
-path "auth/approle/role/device-enrol/secret-id" {
-  capabilities     = ["update"]
-  min_wrapping_ttl = "10s"
-  max_wrapping_ttl = "300s"
+# Read a registration back by name, to confirm it and recover the TPM ID.
+path "identity/tpm/name/*" {
+  capabilities = ["read"]
 }
 
-# Read the RoleID to hand to the device alongside the wrapping token. Public by
-# design — it names the role, it does not authorise anything on its own.
-path "auth/approle/role/device-enrol/role-id" {
-  capabilities = ["read"]
+# Admit a registered TPM to the group the '${TPM_ROLE}' role trusts. This is
+# the only group the orchestrator can touch, and it cannot touch the role.
+path "identity/tpmgroup/name/${TPM_GROUP}" {
+  capabilities = ["read", "update"]
 }
 EOF
 log_ok "policy ${ORCH_POLICY} written"
@@ -265,9 +169,7 @@ log_info "Minting the orchestrator token (24h, policy ${ORCH_POLICY})"
 # for a long-running agent and the wrong one for a demonstration of bounded
 # privilege. 24h outlives any demo session, and a Vault restart kills it sooner.
 #
-# -no-default-policy so the transcript shows exactly the two paths above.
-# 'default' is harmless — cubbyhole and token self-lookup — but nothing in the
-# enrolment flow calls those, and "policies: [enrol-orchestrator]" is the claim.
+# -no-default-policy so the transcript shows exactly the three paths above.
 orch_json="$(as_lab_user vault token create \
   -policy="${ORCH_POLICY}" \
   -no-default-policy \
@@ -278,35 +180,36 @@ orch_token="$(printf '%s' "${orch_json}" | jq -r '.auth.client_token // empty')"
 [[ -n "${orch_token}" ]] || die "vault token create returned no client_token for ${ORCH_POLICY}"
 
 # 0600, not 0644: every other lab artefact is a public key, a certificate or a
-# serial number. This one is a bearer credential.
+# key handle only this TPM can use. This one is a bearer credential.
 printf '%s' "${orch_token}" | write_lab_file "${ORCH_TOKEN_FILE}" 0600
 log_ok "orchestrator token at ${ORCH_TOKEN_FILE} (owner ${LAB_USER}, mode 0600)"
 log_detail "Policies: $(printf '%s' "${orch_json}" | jq -r '.auth.policies | join(", ")')"
 log_detail "TTL:      $(printf '%s' "${orch_json}" | jq -r '.auth.lease_duration')s"
-log_detail "It can mint enrolment SecretIDs, and must wrap them. It cannot sign a CSR,"
-log_detail "read a secret, touch cert auth, or read the device-enrol role's own config."
+log_detail "It can register an EK and admit it to '${TPM_GROUP}'. It cannot change the"
+log_detail "'${TPM_ROLE}' role, read a secret, or mint a token."
 
 # --- sentinel ---------------------------------------------------------------
 # Later scripts gate on this file: it records that Parts 4-5 completed against a
-# particular domain and CA, and survives nothing that Vault itself forgets.
+# particular domain, mount and group, and survives nothing that Vault itself
+# forgets.
 jq -n \
   --arg domain "${DOMAIN}" \
-  --arg ca_serial "${ca_serial}" \
-  --arg ca_pem "${CA_PEM}" \
   --arg device "${DEMO_DEVICE}" \
+  --arg mount "${TPM_MOUNT}" \
+  --arg group "${TPM_GROUP}" \
+  --arg group_id "${group_id}" \
+  --arg role "${TPM_ROLE}" \
   --arg orch_policy "${ORCH_POLICY}" \
   --arg orch_token_file "${ORCH_TOKEN_FILE}" \
   --arg configured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '{
      status: "complete",
      domain: $domain,
-     ca_serial: $ca_serial,
-     ca_pem: $ca_pem,
      demo_device: $device,
-     pki_role: "pki/roles/devices",
-     cert_auth_role: "auth/cert/certs/tpm-devices",
-     approle_role: "auth/approle/role/device-enrol",
-     enrol_policy: "device-enrol",
+     tpm_auth_mount: ("auth/" + $mount),
+     tpm_group: $group,
+     tpm_group_id: $group_id,
+     tpm_role: ("auth/" + $mount + "/role/" + $role),
      orchestrator_policy: $orch_policy,
      orchestrator_token_file: $orch_token_file,
      configured_at: $configured_at
@@ -314,4 +217,4 @@ jq -n \
 
 log_ok "Parts 4-5 complete — state recorded in ${SENTINEL}"
 log_info ''
-log_info "Next: task enrol — create the device key inside the TPM and enrol it."
+log_info "Next: task enrol — register the device's endorsement key and attest it."

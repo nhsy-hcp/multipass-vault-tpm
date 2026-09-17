@@ -8,13 +8,19 @@ LAB_USER="${LAB_USER:-ubuntu}"
 LAB_DIR="${LAB_DIR:-/home/${LAB_USER}/lab}"
 LAB_STATE_DIR="${LAB_STATE_DIR:-${LAB_DIR}/state}"
 LAB_TLS_DIR="${LAB_TLS_DIR:-${LAB_DIR}/vault-tls}"
-LAB_PKI_DIR="${LAB_PKI_DIR:-${LAB_DIR}/pki}"
-export LAB_USER LAB_DIR LAB_STATE_DIR LAB_TLS_DIR LAB_PKI_DIR
+# Where `vault tpm attest` keeps each device's certificate and key blobs.
+LAB_TPM_DIR="${LAB_TPM_DIR:-${LAB_DIR}/tpm}"
+export LAB_USER LAB_DIR LAB_STATE_DIR LAB_TLS_DIR LAB_TPM_DIR
 
-# Software TPM ports. The attacker TPM stands in for a different machine.
-TPM_PORT="${TPM_PORT:-2321}"
-ATTACKER_TPM_PORT="${ATTACKER_TPM_PORT:-2331}"
-export TPM_PORT ATTACKER_TPM_PORT
+# Software TPMs. Each swtpm instance serves a unix socket inside its own state
+# directory, and tpm2-tools, OpenSSL and the Vault CLI all reach the TPM through
+# that one path — on real hardware it becomes /dev/tpmrm0 and nothing else
+# changes. The attacker TPM stands in for a different machine: same software,
+# different storage seed.
+TPM_STATE_ROOT="${TPM_STATE_ROOT:-${LAB_DIR}/tpmstate}"
+TPM_SOCK="${TPM_SOCK:-${TPM_STATE_ROOT}/device/swtpm.sock}"
+ATTACKER_TPM_SOCK="${ATTACKER_TPM_SOCK:-${TPM_STATE_ROOT}/attacker/swtpm.sock}"
+export TPM_STATE_ROOT TPM_SOCK ATTACKER_TPM_SOCK
 
 # Scratch space.
 #
@@ -167,6 +173,33 @@ as_lab_user_allow_fail() {
 
 lab_mkdir() {
   install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0755 "$@"
+}
+
+# Write stdin to a lab-owned file. Vault CLI output is captured by root, so
+# ownership is applied on the way to disk rather than inherited.
+write_lab_file() {
+  local dest="$1" mode="${2:-0644}" tmp
+  tmp="$(mktemp)"
+  cat > "${tmp}"
+  install -o "${LAB_USER}" -g "${LAB_USER}" -m "${mode}" "${tmp}" "${dest}"
+  rm -f "${tmp}"
+}
+
+# --- TPM housekeeping -------------------------------------------------------
+# flush_tpm_contexts [socket]
+#
+# The software TPM is reached over a raw socket. There is no kernel resource
+# manager (/dev/tpmrm0) in the path to free transient objects when a client
+# disconnects, and `vault login -method=tpm` leaves one loaded key behind per
+# call. swtpm has three transient slots, so the fourth login would fail with
+# "out of memory for object contexts". Flush before every TPM-touching Vault
+# command. On real hardware the resource manager makes this unnecessary.
+flush_tpm_contexts() {
+  local sock="${1:-${TPM_SOCK}}"
+  as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
+    tpm2_flushcontext -t >/dev/null 2>&1 || true
+  as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
+    tpm2_flushcontext -l >/dev/null 2>&1 || true
 }
 
 # --- misc -------------------------------------------------------------------

@@ -1,4 +1,4 @@
-// Vault TPM-backed cert auth lab — component topology.
+// Vault TPM auth lab — component topology.
 // Render: dot -Tpng -Gdpi=144 -o topology.png topology.dot
 // or: task docs:diagram
 
@@ -49,8 +49,17 @@ digraph topology {
 
     term  [label="Terminal\nTaskfile.yml"];
     mpcli [label="Multipass CLI"];
+    bin   [
+      label=".bin/\nvault_2.2.0-beta1+ent (private beta)\nvault.hclic\n— gitignored, never committed",
+      shape=note,
+      style="filled",
+      fillcolor="#f7f0fa",
+      color="#7d5b92",
+      fontsize=10
+    ];
 
     term -> mpcli [label="task …"];
+    bin -> mpcli [label="task provision\npushes both", style=dotted, color="#7d5b92", fontcolor="#5b3f6c"];
   }
 
   // ------------------------------------------------------------------- the VM
@@ -66,13 +75,13 @@ digraph topology {
     penwidth=1.2;
 
     tpm [
-      label="swtpm@device\nsoftware TPM 2.0\ntcp :2321",
+      label="swtpm@device\nsoftware TPM 2.0\n~/lab/tpmstate/device/swtpm.sock",
       fillcolor="#dcedd9",
       color="#5f8a57"
     ];
 
     attacker [
-      label="swtpm@attacker\ntcp :2331\ndifferent storage seed\n(Part 8.1 only)",
+      label="swtpm@attacker\n~/lab/tpmstate/attacker/swtpm.sock\ndifferent storage seed, different EK\n(Part 8 only)",
       style="rounded,filled,dashed",
       fillcolor="#f2f2f0",
       color="#6b6b64",
@@ -80,14 +89,14 @@ digraph topology {
     ];
 
     client [
-      label="Device client\nopenssl + tpm2 provider\nnode01.devices.lab.local",
+      label="Device client\nvault tpm attest / vault login -method=tpm\nnode01.devices.lab.local",
       fillcolor="#fdf0da",
       color="#b5883f"
     ];
 
     // ------------------------------------------------------------ Vault itself
     subgraph cluster_vault {
-      label="vault-dev  —  https://127.0.0.1:8200  (dev, in-memory)";
+      label="vault-dev  —  Vault Enterprise 2.2.0-beta1, https://127.0.0.1:8200  (dev, in-memory)";
       labeljust="l";
       fontsize=12;
       fontcolor="#1a202c";
@@ -97,9 +106,9 @@ digraph topology {
       color="#9e7fae";
       penwidth=1.2;
 
-      pki  [label="PKI engine\ndevice CA\nrole: devices",   fillcolor="#ece0f2", color="#7d5b92"];
-      cert [label="cert auth method\nrole: tpm-devices",     fillcolor="#ece0f2", color="#7d5b92"];
-      kv   [label="KV v2\nsecret/devices/node01",            fillcolor="#ece0f2", color="#7d5b92"];
+      reg  [label="identity/tpm\nregistry of endorsement keys\ngroup: devices",         fillcolor="#ece0f2", color="#7d5b92"];
+      tpma [label="tpm auth method\ninternal CA + role: devices\n(trusts the group)",     fillcolor="#ece0f2", color="#7d5b92"];
+      kv   [label="KV v2\nsecret/devices/node01",                                      fillcolor="#ece0f2", color="#7d5b92"];
     }
   }
 
@@ -114,12 +123,12 @@ digraph topology {
   ];
 
   // ----------------------------------------------------------------- lab flows
-  client -> tpm  [label="sign with\nnon-exportable key", color="#5f8a57", fontcolor="#3f5f39"];
-  pki    -> client [label="1. signs CSR →\ndevice certificate", color="#7d5b92", fontcolor="#5b3f6c"];
-  client -> cert   [label="2. mTLS login\n(client cert + TPM signature)", color="#b5883f", fontcolor="#7d5c22"];
-  cert   -> pki    [label="trusts device CA", style=dotted, constraint=false, color="#7d5b92", fontcolor="#5b3f6c"];
-  cert   -> client [label="3. token, policy device-read", color="#7d5b92", fontcolor="#5b3f6c"];
-  client -> kv     [label="4. read (write denied)", color="#b5883f", fontcolor="#7d5c22"];
+  client -> tpm    [label="EK, AK, app key:\nall created and used\ninside the TPM", color="#5f8a57", fontcolor="#3f5f39"];
+  client -> reg    [label="1. orchestrator registers\nthe EK (scoped token)", color="#7d5b92", fontcolor="#5b3f6c"];
+  client -> tpma   [label="2. attest (no token) →\ncertificate; 3. mTLS login", color="#b5883f", fontcolor="#7d5c22"];
+  tpma   -> reg    [label="looks the EK up", style=dotted, constraint=false, color="#7d5b92", fontcolor="#5b3f6c"];
+  tpma   -> client [label="4. token, policy device-read", color="#7d5b92", fontcolor="#5b3f6c"];
+  client -> kv     [label="5. read (write denied)", color="#b5883f", fontcolor="#7d5c22"];
 
   client -> attacker [
     # constraint=false leaves this edge out of rank assignment, so the spline
@@ -127,7 +136,7 @@ digraph topology {
     # padding, so the clearance has to be structural: an HTML label with an
     # empty right-hand cell shifts the text off the line.
     label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="0" CELLSPACING="0"><TR>
-             <TD ALIGN="RIGHT">Part 8.1:<BR/>same key blob,<BR/>different TPM &#8594;<BR/>handshake fails</TD>
+             <TD ALIGN="RIGHT">Part 8.1: same blobs,<BR/>different TPM &#8594;<BR/>integrity check fails<BR/>Part 8.2: unregistered EK &#8594;<BR/>refused at attestation</TD>
              <TD WIDTH="24"></TD></TR></TABLE>>,
     style=dashed,
     color="#6b6b64",

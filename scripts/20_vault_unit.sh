@@ -14,8 +14,14 @@ log_step "Part 3: start the Vault dev server (TLS)"
 
 UNIT_PATH="/etc/systemd/system/vault-dev.service"
 
-require_cmd vault systemctl || die "run 'task provision' first"
+VAULT_BIN="/usr/local/bin/vault"
+LICENCE_PATH="${LAB_DIR}/vault.hclic"
+
+require_cmd systemctl || die "systemctl not found"
+[[ -x "${VAULT_BIN}" ]] || die "${VAULT_BIN} is missing — run 'task provision' first"
 [[ -f "${LAB_DIR}/env.sh" ]] || die "${LAB_DIR}/env.sh is missing — run 'task provision' first"
+[[ -s "${LICENCE_PATH}" ]] \
+  || log_warn "no licence at ${LICENCE_PATH} — Vault Enterprise will refuse to start; copy it to .bin/vault.hclic on the host and re-run 'task provision'"
 
 # The dev server writes its self-signed certificate material here on every
 # start, so the directory must exist and be writable by the lab user.
@@ -54,7 +60,8 @@ Type=simple
 User=${LAB_USER}
 Group=${LAB_USER}
 WorkingDirectory=${LAB_DIR}
-ExecStart=/usr/bin/vault server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
+Environment=VAULT_LICENSE_PATH=${LICENCE_PATH}
+ExecStart=${VAULT_BIN} server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
 Restart=on-failure
 RestartSec=2
 
@@ -106,5 +113,5 @@ done
 log_info "vault status (expect 'Sealed false' and 'Storage Type inmem'):"
 as_lab_user vault status | sed 's/^/  /'
 
-log_warn "Dev mode keeps everything in memory. Restarting vault-dev wipes the PKI mount, the policy, the cert auth role and the KV secret — run 'task config && task enrol' to rebuild them."
+log_warn "Dev mode keeps everything in memory. Restarting vault-dev wipes the tpm auth mount and its CA, the TPM registry, the policies and the KV secret — run 'task config && task enrol' to rebuild them."
 log_ok "Part 3 complete — next: task config"

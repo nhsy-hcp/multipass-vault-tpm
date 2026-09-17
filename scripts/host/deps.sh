@@ -43,8 +43,24 @@ fi
 log_step "Multipass"
 multipass version | sed 's/^/  /'
 
+# Vault Enterprise is a private beta binary copied by hand into .bin/, never an
+# apt package. Report rather than fail: `task provision` is the hard gate.
+log_step "Vault Enterprise binary"
+VAULT_BIN="${1:-.bin/vault_2.2.0-beta1+ent_linux_arm64}"
+VAULT_LICENSE="${2:-.bin/vault.hclic}"
+if [[ -f "${PROJECT_ROOT}/${VAULT_BIN}" ]]; then
+  log_ok "${VAULT_BIN}"
+else
+  log_warn "${VAULT_BIN} not found — copy the private beta binary into .bin/ before 'task provision'"
+fi
+if [[ -f "${PROJECT_ROOT}/${VAULT_LICENSE}" ]]; then
+  log_ok "${VAULT_LICENSE}"
+else
+  log_warn "${VAULT_LICENSE} not found — Vault Enterprise will not start without a licence"
+fi
+
 log_info ''
-log_detail "Apple Silicon hosts create arm64 guests; the HashiCorp apt repo and"
-log_detail "Ubuntu TPM packages both publish arm64 builds, so no changes are needed."
+log_detail "Apple Silicon hosts create arm64 guests; the Vault binary is linux/arm64 and"
+log_detail "the Ubuntu TPM packages publish arm64 builds, so no changes are needed."
 
 log_ok "host is ready — next: task all"

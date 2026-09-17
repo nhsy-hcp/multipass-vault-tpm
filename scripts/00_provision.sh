@@ -4,19 +4,30 @@ STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${STAGE_DIR}/common.sh"
 
-# Part 1: install the TPM tooling and Vault, and lay out the lab directory.
+# Part 1: install the TPM tooling and Vault Enterprise, and lay out the lab
+# directory.
 #
 # Runs as root inside the VM via `sudo -E bash <stage>/00_provision.sh`.
 # Everything here is idempotent: re-running on a provisioned VM should touch
 # apt at most once and finish in seconds.
+#
+# Vault is a private beta Enterprise build, not an apt package. `task provision`
+# pushes it (and the licence) from the host's .bin/ into the staging directory
+# before this script runs; §1.2 installs the staged copy.
 
-log_step "Part 1: install TPM tooling and Vault"
+log_step "Part 1: install TPM tooling and Vault Enterprise"
 
 # Non-interactive or dpkg will block on service-restart prompts under `multipass exec`.
 export DEBIAN_FRONTEND=noninteractive
 
+# Left behind by builds that installed Vault from apt. Removed in §1.2.
 KEYRING="/usr/share/keyrings/hashicorp-archive-keyring.gpg"
 HASHICORP_LIST="/etc/apt/sources.list.d/hashicorp.list"
+
+VAULT_STAGED="${STAGE_DIR}/vault"
+VAULT_INSTALLED="/usr/local/bin/vault"
+LICENCE_STAGED="${STAGE_DIR}/vault.hclic"
+LICENCE_INSTALLED="${LAB_DIR}/vault.hclic"
 
 # --- apt helpers -------------------------------------------------------------
 
@@ -52,8 +63,8 @@ apt_install() {
 
 log_info "Checking base packages..."
 BASE_PACKAGES=(
-  swtpm swtpm-tools tpm2-tools tpm2-openssl
-  jq tmux gpg wget lsb-release ca-certificates
+  swtpm swtpm-tools tpm2-tools
+  jq tmux ca-certificates
 )
 
 missing=()
@@ -87,68 +98,71 @@ else
   apt_install "${tcti_pkg}"
 fi
 
-# --- 1.2 Vault ---------------------------------------------------------------
+# --- 1.2 Vault Enterprise ----------------------------------------------------
 
-log_step "HashiCorp apt repository"
+log_step "Vault Enterprise binary"
 
-# The source line is built from command substitutions. If one of these is
-# missing the heredoc below would silently write a malformed apt entry, so fail
-# loudly instead.
-require_cmd wget gpg lsb_release dpkg \
-  || die "the base package install did not provide the tools needed to add the HashiCorp repo"
+# Only the linux/arm64 build is shipped in .bin/.
+arch="$(dpkg --print-architecture)"
+[[ "${arch}" == "arm64" ]] || die "this VM is ${arch}; the private beta Vault binary is linux/arm64 only"
 
-repo_changed=0
-if [[ -s "${KEYRING}" ]]; then
-  log_detected "existing keyring at ${KEYRING}" "skipping the fetch and dearmor"
-else
-  log_info "Fetching and dearmoring the HashiCorp apt signing key..."
-  # Dearmor straight to the keyring; a partial file here would break every
-  # later apt run, so write via a temp file and move it into place.
-  tmp_key="$(mktemp)"
-  wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --dearmor > "${tmp_key}"
-  install -m 0644 "${tmp_key}" "${KEYRING}"
-  rm -f "${tmp_key}"
-  repo_changed=1
-fi
-
-if write_if_changed "${HASHICORP_LIST}" <<EOF
-deb [arch=$(dpkg --print-architecture) signed-by=${KEYRING}] https://apt.releases.hashicorp.com $(lsb_release -cs) main
-EOF
-then
-  log_info "Wrote ${HASHICORP_LIST}"
-  repo_changed=1
-else
-  log_detected "unchanged ${HASHICORP_LIST}" "no apt list rewrite needed"
-fi
-
-# A new key or a rewritten source line means the cached lists predate the repo.
-# apt_update_once is a no-op after the base install has already refreshed, so
-# clear the flag first — otherwise the HashiCorp index is never fetched and
-# `apt-get install vault` fails with "Unable to locate package".
-if (( repo_changed )); then
-  APT_UPDATED=0
-  apt_update_once
-fi
-
+# A VM built before the switch to Enterprise carries the apt package at
+# /usr/bin/vault plus the HashiCorp repo. Remove both so there is exactly one
+# Vault on the box and apt stops fetching an index nothing uses.
 if pkg_installed vault; then
-  log_detected "existing vault package" "skipping the install"
-else
-  # Guard against a stale index from any earlier run: if apt cannot see the
-  # package at all, refresh unconditionally before giving up on it.
-  if ! apt-cache show vault >/dev/null 2>&1; then
-    log_detected "vault absent from the apt index" "refreshing package lists"
-    APT_UPDATED=0
-  fi
-  apt_update_once
-  apt_install vault
+  log_detected "the apt vault package" "removing it — Vault now comes from the staged Enterprise binary"
+  systemctl disable --now vault.service 2>/dev/null || true
+  apt-get remove -y -qq vault
 fi
+if [[ -f "${HASHICORP_LIST}" || -f "${KEYRING}" ]]; then
+  log_detected "the HashiCorp apt repository" "removing it — no longer used"
+  rm -f "${HASHICORP_LIST}" "${KEYRING}"
+fi
+
+# The host's push script skips the transfer when the installed copy already
+# matches, so an absent staged file with a present installed one is normal.
+if [[ -s "${VAULT_STAGED}" ]]; then
+  if [[ -f "${VAULT_INSTALLED}" ]] && cmp -s "${VAULT_STAGED}" "${VAULT_INSTALLED}"; then
+    log_detected "unchanged ${VAULT_INSTALLED}" "skipping the install"
+  else
+    log_info "Installing ${VAULT_STAGED} → ${VAULT_INSTALLED}"
+    install -m 0755 -o root -g root "${VAULT_STAGED}" "${VAULT_INSTALLED}"
+  fi
+elif [[ -x "${VAULT_INSTALLED}" ]]; then
+  log_detected "no staged binary, ${VAULT_INSTALLED} present" "keeping the installed copy"
+else
+  die "no Vault binary at ${VAULT_STAGED} — run 'task provision', which pushes .bin/vault_2.2.0-beta1+ent_linux_arm64 from the host"
+fi
+
+# /usr/local/bin precedes /usr/bin in the lab user's PATH and in sudo's
+# secure_path, so this is the `vault` every later script sees.
+vault_ver="$("${VAULT_INSTALLED}" version 2>&1)" \
+  || die "${VAULT_INSTALLED} does not run — a partial transfer? re-run 'task provision'"
+[[ "${vault_ver}" == *"+ent"* ]] \
+  || die "${VAULT_INSTALLED} is not an Enterprise build: ${vault_ver}"
+log_ok "${vault_ver}"
 
 # --- 1.3 Lab directory and environment file ----------------------------------
 
 log_step "Lab directory and environment file"
 
-lab_mkdir "${LAB_DIR}" "${LAB_STATE_DIR}" "${LAB_TLS_DIR}" "${LAB_PKI_DIR}" "${LAB_DIR}/logs"
+lab_mkdir "${LAB_DIR}" "${LAB_STATE_DIR}" "${LAB_TLS_DIR}" "${LAB_TPM_DIR}" "${LAB_DIR}/logs"
 log_ok "lab tree under ${LAB_DIR}"
+
+# Enterprise licence, read by the dev server via VAULT_LICENSE_PATH in the
+# vault-dev unit. Owned by the lab user because that is who runs the server.
+if [[ -s "${LICENCE_STAGED}" ]]; then
+  if [[ -f "${LICENCE_INSTALLED}" ]] && cmp -s "${LICENCE_STAGED}" "${LICENCE_INSTALLED}"; then
+    log_detected "unchanged ${LICENCE_INSTALLED}" "skipping the install"
+  else
+    install -m 0600 -o "${LAB_USER}" -g "${LAB_USER}" "${LICENCE_STAGED}" "${LICENCE_INSTALLED}"
+    log_ok "installed licence at ${LICENCE_INSTALLED}"
+  fi
+elif [[ -s "${LICENCE_INSTALLED}" ]]; then
+  log_detected "existing licence at ${LICENCE_INSTALLED}" "keeping it"
+else
+  log_warn "no licence staged or installed — Vault Enterprise will not start; copy it to .bin/vault.hclic on the host and re-run 'task provision'"
+fi
 
 # One environment file, sourced by interactive shells and by as_lab_user()
 # alike, so an automated step and a live demo shell behave identically.
@@ -158,23 +172,27 @@ log_ok "lab tree under ${LAB_DIR}"
 # stay on the host — only scripts/ and lib/common.sh are transferred into the VM.
 #
 # The \$ escapes keep the :- defaults literal in the written file, so a caller
-# can override TPM2TOOLS_TCTI to aim at the attacker TPM (port ${ATTACKER_TPM_PORT}).
+# can override the TPM path to aim at the attacker TPM.
 if write_if_changed "${LAB_DIR}/env.sh" <<EOF
-# Lab environment for the Vault TPM cert-auth lab.
+# Lab environment for the Vault TPM auth lab.
 # Generated by scripts/00_provision.sh — edit templates/lab-env.sh.tpl and the
 # heredoc in that script, not this file.
 
 export LAB_DIR="${LAB_DIR}"
+export LAB_TPM_DIR="${LAB_TPM_DIR}"
 
-# TPM connection. The software TPM speaks TCP, so the TCTI names a port rather
-# than /dev/tpmrm0 — on real hardware this is the only line that changes.
+# TPM connection. Each software TPM serves a unix socket, and tpm2-tools and
+# the Vault CLI reach the same TPM through the same path. On real hardware this
+# becomes /dev/tpmrm0 (TCTI "device:/dev/tpmrm0") and nothing else changes.
 #
-# Both are written with a :- default so a caller can point a single command at
-# the attacker TPM without editing this file:
-#   TPM2TOOLS_TCTI=swtpm:port=${ATTACKER_TPM_PORT} tpm2_getrandom 8 --hex
-# That is how the Part 8.1 stolen-key demo simulates a different machine.
-export TPM2TOOLS_TCTI="\${TPM2TOOLS_TCTI:-swtpm:port=${TPM_PORT}}"
-export TPM2OPENSSL_TCTI="\${TPM2OPENSSL_TCTI:-swtpm:port=${TPM_PORT}}"
+# Written with :- defaults so a caller can point one command at the attacker
+# TPM without editing this file — that is how the Part 8 demos simulate a
+# different machine:
+#   vault tpm ek -tpm-device-path=\${ATTACKER_TPM_DEVICE_PATH}
+#   TPM2TOOLS_TCTI=swtpm:path=\${ATTACKER_TPM_DEVICE_PATH} tpm2_getrandom 8 --hex
+export TPM_DEVICE_PATH="\${TPM_DEVICE_PATH:-${TPM_SOCK}}"
+export TPM2TOOLS_TCTI="\${TPM2TOOLS_TCTI:-swtpm:path=${TPM_SOCK}}"
+export ATTACKER_TPM_DEVICE_PATH="${ATTACKER_TPM_SOCK}"
 
 # Vault dev server with TLS. The dev certificate is issued for 127.0.0.1 only,
 # which is why client and server both live inside the VM.
@@ -196,11 +214,11 @@ log_ok "${LAB_DIR}/env.sh owned by ${LAB_USER}, mode 0644"
 
 log_step "Verify Part 1"
 
-require_cmd swtpm swtpm_setup tpm2_getrandom tpm2_getcap openssl vault jq \
+require_cmd swtpm swtpm_setup tpm2_getrandom tpm2_getcap tpm2_flushcontext tpm2_print openssl vault jq \
   || die "provisioning left a required command missing — see the errors above"
 
-log_info "vault version:"
-log_detail "  $(vault version)"
+log_info "vault on PATH (expect ${VAULT_INSTALLED}):"
+log_detail "  $(command -v vault) — $(vault version)"
 
 # `-v` only prints the tool banner, but it still loads the TCTI library, so a
 # failure here usually means the TCTI package resolved above is not usable.

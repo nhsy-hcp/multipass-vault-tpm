@@ -4,9 +4,9 @@
 # VM, so the authoritative content is the heredoc in scripts/20_vault_unit.sh.
 # Keep the two in sync.
 #
-# Installed as /etc/systemd/system/vault-dev.service. Deliberately a separate
-# unit from the `vault.service` shipped by the HashiCorp package: this one runs
-# the throwaway in-memory dev server, not a production configuration.
+# Installed as /etc/systemd/system/vault-dev.service. The binary is the Vault
+# Enterprise private beta installed by 00_provision.sh at /usr/local/bin/vault,
+# and the Enterprise licence is passed via VAULT_LICENSE_PATH.
 #
 # -dev-listen-address is omitted on purpose. It defaults to 127.0.0.1:8200, and
 # the dev TLS certificate is issued for 127.0.0.1 only — binding anywhere else
@@ -23,7 +23,8 @@ Type=simple
 User=${LAB_USER}
 Group=${LAB_USER}
 WorkingDirectory=${LAB_DIR}
-ExecStart=/usr/bin/vault server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
+Environment=VAULT_LICENSE_PATH=${LAB_DIR}/vault.hclic
+ExecStart=/usr/local/bin/vault server -dev -dev-tls -dev-root-token-id=root -dev-tls-cert-dir=${LAB_TLS_DIR}
 Restart=on-failure
 RestartSec=2
 

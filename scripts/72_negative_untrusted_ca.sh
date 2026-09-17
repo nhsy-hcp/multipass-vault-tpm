@@ -1,58 +1,103 @@
 #!/bin/bash
-# Part 8.3: a certificate from an untrusted CA is rejected.
+# Part 8.3: a genuine TPM certificate from a different CA is rejected.
 #
-# The rogue key is generated in the *same* TPM as the real device key. That is
-# the point: possession of a TPM-held key proves nothing on its own. Vault
-# trusts a CA, not a TPM, so a self-signed certificate — however well its key is
-# protected — has no path to the device CA and is refused.
+# The rogue certificate is earned by the *same* TPM, with the *same* EK, by a
+# real attestation — against a second tpm auth mount, which has its own
+# internal CA. That is the point: hardware-backed and honestly attested is not
+# the same as issued by the CA this mount trusts. Vault trusts its own CA, not
+# a TPM, so the login is refused however good the key is.
 set -euo pipefail
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${STAGE_DIR}/common.sh"
 
-DOMAIN="${1:-devices.lab.local}"
-ROGUE_KEY="${LAB_PKI_DIR}/rogue.tpmkey.pem"
-ROGUE_CRT="${LAB_PKI_DIR}/rogue.crt"
+DEVICE="${1:-node01}"
+DOMAIN="${2:-devices.lab.local}"
+CN="${DEVICE}.${DOMAIN}"
+STATE_DIR="${LAB_TPM_DIR}/${DEVICE}"
+ROGUE_MOUNT="tpm-rogue"
+ROGUE_STATE="${LAB_TPM_DIR}/rogue"
+NO_TOKEN="device-holds-no-token"
 
-log_step "Part 8.3: a certificate from an untrusted CA"
+log_step "Part 8.3: a certificate from a CA this mount does not trust"
 
-if [[ -f "${ROGUE_KEY}" ]] && head -1 "${ROGUE_KEY}" | grep -q 'TSS2 PRIVATE KEY'; then
-  log_detected "an existing rogue TPM key" "reusing it"
+[[ -s "${STATE_DIR}/tpm_id" ]] || die "no enrolment for ${DEVICE} at ${STATE_DIR}; run 'task enrol' first"
+[[ -S "${TPM_SOCK}" ]] || die "no TPM socket at ${TPM_SOCK} — run 'task tpm' first"
+require_cmd jq openssl || die "missing prerequisites"
+tpm_id="$(<"${STATE_DIR}/tpm_id")"
+lab_mkdir "${LAB_TPM_DIR}" "${ROGUE_STATE}"
+
+log_info "A second tpm auth mount stands in for an unrelated CA. Same Vault, same"
+log_info "TPM, same registered EK — but a different mount, so a different internal CA."
+log_info ""
+
+# Operator work, so root is appropriate: this is a stand-in for a second,
+# unrelated certificate authority that happens to also trust this TPM.
+if as_lab_user vault auth list -format=json | jq -e --arg p "${ROGUE_MOUNT}/" 'has($p)' >/dev/null 2>&1; then
+  log_detected "the ${ROGUE_MOUNT} mount already enabled" "reusing it"
 else
-  log_info "Generating a rogue key inside the same TPM..."
-  as_lab_user openssl genpkey -provider tpm2 -provider default \
-    -propquery '?provider=tpm2' \
-    -algorithm EC -pkeyopt group:P-256 -out "${ROGUE_KEY}"
-  log_ok "rogue key created in the TPM"
+  as_lab_user vault auth enable -path="${ROGUE_MOUNT}" tpm >/dev/null
+  log_ok "enabled auth/${ROGUE_MOUNT} — it generated its own CA on the spot"
 fi
+as_lab_user vault write "auth/${ROGUE_MOUNT}/config" default_cert_ttl=1h >/dev/null
+as_lab_user vault write "auth/${ROGUE_MOUNT}/role/devices" tpm_ids="${tpm_id}" token_policies=default >/dev/null
+log_ok "auth/${ROGUE_MOUNT}/role/devices trusts ${tpm_id:0:20}…"
 
-log_info "Self-signing a certificate for rogue.${DOMAIN} — no CA involved..."
-as_lab_user openssl req -new -x509 -days 1 \
-  -provider tpm2 -provider default -propquery '?provider=tpm2' \
-  -key "${ROGUE_KEY}" -subj "/CN=rogue.${DOMAIN}" -out "${ROGUE_CRT}"
+log_step "Attesting the device TPM against auth/${ROGUE_MOUNT} (a real attestation)"
+attempt=0
+while :; do
+  attempt=$(( attempt + 1 ))
+  flush_tpm_contexts
+  rc=0
+  out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
+    vault tpm attest -role-name=devices -mount-path="auth/${ROGUE_MOUNT}" \
+      -tpm-device-path="${TPM_SOCK}" -tpm-state-dir="${ROGUE_STATE}" \
+      -cert-subject-CN="${CN}" 2>&1)" || rc=$?
+  if (( rc == 0 )); then break; fi
+  if printf '%s' "${out}" | grep -qi 'rate limit' && (( attempt < 4 )); then
+    log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying"
+    sleep 12
+  else
+    printf '%s\n' "${out}" >&2
+    die "attestation against ${ROGUE_MOUNT} failed (rc=${rc}) — the demo needs a rogue-CA certificate to present"
+  fi
+done
+log_ok "$(printf '%s\n' "${out}" | grep -m1 -v '^[[:space:]]*$')"
 
-log_detail "$(as_lab_user openssl x509 -in "${ROGUE_CRT}" -noout -subject -issuer)"
 log_info ""
-log_detail "Note the subject and issuer are identical — it is self-signed."
+log_detail "  rogue cert issuer:  $(as_lab_user openssl x509 -in "${ROGUE_STATE}/client.crt" -noout -issuer | sed 's/^issuer=//')"
+log_detail "  rogue CA serial:    $(as_lab_user openssl x509 -in "${ROGUE_STATE}/ca_chain.pem" -noout -serial | sed 's/^serial=//')"
+log_detail "  trusted CA serial:  $(as_lab_user openssl x509 -in "${STATE_DIR}/ca_chain.pem" -noout -serial | sed 's/^serial=//')"
+log_detail "  Same issuer name, different CA key: the names match, the chain does not."
 log_info ""
 
-log_step "Attempting login with the rogue certificate"
+log_step "Presenting the rogue-CA certificate to auth/tpm"
 out=''
 rc=0
-out="$(bash "${STAGE_DIR}/50_login.sh" rogue --cert "${ROGUE_CRT}" --key "${ROGUE_KEY}" --quiet-json 2>&1)" || rc=$?
+out="$(bash "${STAGE_DIR}/50_login.sh" "${DEVICE}" --state-dir "${ROGUE_STATE}" --quiet-json 2>&1)" || rc=$?
 
 if (( rc == 0 )); then
-  log_error "a token WAS issued for an untrusted certificate"
-  report_expect "login rejected: certificate does not chain to the device CA" \
+  log_error "a token WAS issued for a certificate from another CA"
+  report_expect "login rejected: certificate does not chain to this mount's CA" \
                 "login SUCCEEDED — the trust anchor is not being enforced"
   exit 1
 fi
 
-report_expect "login rejected: certificate does not chain to the device CA" \
+report_expect "login rejected: certificate does not chain to this mount's CA" \
               "login failed (rc=${rc})"
-log_detail "$(printf '%s\n' "${out}" | tail -5 | sed 's/^/    /')"
+log_detail "$(printf '%s\n' "${out}" | grep -v '^[[:space:]]*$' | tail -3 | sed 's/^/    /')"
+
+log_step "Control: the same certificate IS accepted by the mount that issued it"
+rc=0
+bash "${STAGE_DIR}/50_login.sh" "${DEVICE}" --state-dir "${ROGUE_STATE}" \
+  --mount "${ROGUE_MOUNT}" --no-save >/dev/null 2>&1 || rc=$?
+if (( rc == 0 )); then
+  report_expect "login to auth/${ROGUE_MOUNT} succeeds" "login succeeded — the certificate is genuine"
+else
+  report_expect "login to auth/${ROGUE_MOUNT} succeeds" "login failed (rc=${rc}) — unexpected; the rogue mount may be misconfigured"
+fi
 
 log_info ""
-log_ok "A key in a TPM is not enough."
-log_info "Vault's trust anchor is the device CA it was configured with. Hardware"
+log_ok "A key in a TPM, honestly attested, is still not enough."
+log_info "Each tpm auth mount trusts only the certificates it issued itself. Hardware"
 log_info "protection secures the key; the CA decides whose key counts."

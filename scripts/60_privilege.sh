@@ -10,7 +10,7 @@ source "${STAGE_DIR}/common.sh"
 # expect-vs-actual so the operator judges the outcome rather than trusting a
 # green tick:
 #
-#   1. token lookup  -> display_name cert-tpm-devices, TTL around 15m
+#   1. token lookup  -> display_name tpm-tpm-devices, TTL around 15m
 #   2. kv get        -> succeeds
 #   3. kv put        -> permission denied  (the failure IS the pass condition)
 #
@@ -66,13 +66,15 @@ if (( rc == 0 )); then
   display_name="$(printf '%s' "${lookup}" | jq -r '.data.display_name // "(none)"')"
   ttl="$(printf '%s' "${lookup}" | jq -r '.data.ttl // 0')"
   policies="$(printf '%s' "${lookup}" | jq -r '(.data.policies // []) | join(", ")')"
+  tpm_id="$(printf '%s' "${lookup}" | jq -r '.data.meta.tpm_id // "(none)"')"
   [[ "${ttl}" =~ ^[0-9]+$ ]] || ttl=0
-  report_expect "display_name cert-tpm-devices, ttl ~15m" \
+  report_expect "display_name tpm-tpm-devices, ttl ~15m" \
                 "display_name ${display_name}, ttl ${ttl}s (~$(( ttl / 60 ))m)"
   log_detail "   policies: ${policies}"
-  [[ "${display_name}" == "cert-tpm-devices" ]] || log_warn "display_name is not cert-tpm-devices — was the cert role renamed?"
+  log_detail "   tpm_id:   ${tpm_id} — the token is bound to the TPM that authenticated"
+  [[ "${display_name}" == "tpm-tpm-devices" ]] || log_warn "display_name is not tpm-tpm-devices — was the tpm auth role renamed?"
 else
-  report_expect "display_name cert-tpm-devices, ttl ~15m" "lookup failed: $(first_line "${lookup}")"
+  report_expect "display_name tpm-tpm-devices, ttl ~15m" "lookup failed: $(first_line "${lookup}")"
   log_warn "the token is not usable — it may already have expired (15m TTL)"
 fi
 

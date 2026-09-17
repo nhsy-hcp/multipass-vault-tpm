@@ -1,4 +1,4 @@
-// Vault TPM-backed cert auth lab — enrolment and login trust flow.
+// Vault TPM auth lab — enrolment and login trust flow.
 // Render: dot -Tpng -Gdpi=144 -o enrolment.png enrolment.dot
 // or: task docs:diagram
 
@@ -14,7 +14,7 @@ digraph enrolment {
   fontsize=12;
   fontcolor="#1a202c";
   labelloc="t";
-  label="Enrolment and login — the private key never leaves the TPM,\nand neither side of enrolment holds the root token";
+  label="Enrolment and login — the endorsement key is the credential,\nand the device never holds a Vault token to enrol";
 
   node [
     shape=box,
@@ -37,15 +37,15 @@ digraph enrolment {
     arrowsize=0.7
   ];
 
-  // --------------------------------------------------------- 1. key generation
+  // ------------------------------------------------------- 1. the endorsement key
   s1 [
-    label="1.  openssl genpkey -provider tpm2\nkey pair created INSIDE the TPM",
+    label="1.  vault tpm ek\nthe endorsement key: created from a seed\nburned in at manufacture, never leaves the TPM",
     fillcolor="#dcedd9",
     color="#5f8a57"
   ];
 
-  blob [
-    label="on disk: node01.tpmkey.pem\n-----BEGIN TSS2 PRIVATE KEY-----\nwrapped to the TPM storage root key\n— not a usable private key",
+  ekpub [
+    label="ek.pub + tpm_id\nthe public half, and\nsha256(EK public key)\n— public, not a secret",
     shape=note,
     style="filled",
     fillcolor="#f3f8f2",
@@ -53,14 +53,7 @@ digraph enrolment {
     fontsize=10
   ];
 
-  // ------------------------------------------------------------------- 2. CSR
-  s2 [
-    label="2.  openssl req -new\nCSR signature computed by the TPM\nproves possession without export",
-    fillcolor="#dcedd9",
-    color="#5f8a57"
-  ];
-
-  // --------------------------------------- 3. orchestrator mints the credential
+  // ---------------------------------------- 2. orchestrator registers the device
   subgraph cluster_orchestrator {
     label="Orchestrator  —  provisioning system, scoped token (not root)";
     labeljust="l";
@@ -72,27 +65,16 @@ digraph enrolment {
     color="#8fa0b5";
     penwidth=1.2;
 
-    s3 [
-      label="3.  vault write -f -wrap-ttl=120s\nauth/approle/role/device-enrol/secret-id\nenrol-orchestrator token — its only privilege:\nupdate on .../secret-id (wrapping mandatory)",
+    s2 [
+      label="2.  vault write identity/tpm  name=node01  tpm_ek_public_key=@ek.pub\nvault write identity/tpmgroup/name/devices  member_tpm_ids=…\nenrol-orchestrator token — register an EK, admit it to one group,\nnothing else: it cannot touch the auth role or read a secret",
       fillcolor="#ece0f2",
       color="#7d5b92"
     ];
-
-    wrap [
-      label="wrapping token\nunwraps exactly once, 120s\ninterception is detectable,\nnot prevented",
-      shape=note,
-      style="filled",
-      fillcolor="#f7f0fa",
-      color="#7d5b92",
-      fontsize=10
-    ];
-
-    s3 -> wrap [color="#7d5b92"];
   }
 
-  // -------------------------------------- 5-6. device redeems it, no root token
+  // --------------------------------------------- 3-5. device attests, no token
   subgraph cluster_device {
-    label="Device  —  no root token, ever";
+    label="Device  —  no Vault token, ever";
     labeljust="l";
     fontsize=12;
     fontcolor="#1a202c";
@@ -102,48 +84,55 @@ digraph enrolment {
     color="#d9b678";
     penwidth=1.2;
 
+    s3 [
+      label="3.  gentpmcert/begin\nEK public key + a fresh attestation key (AK)\nVault: is this EK registered? does the role trust it?",
+      fillcolor="#ece0f2",
+      color="#7d5b92"
+    ];
+
+    s4 [
+      label="4.  TPM2_ActivateCredential\nVault's challenge is encrypted to the EK and bound to the AK;\nonly a TPM holding both can decrypt it",
+      fillcolor="#dcedd9",
+      color="#5f8a57"
+    ];
+
     s5 [
-      label="5.  vault unwrap -field=secret_id\nSecretID: 1 use, ttl 10m",
+      label="5.  gentpmcert/finish\ndecrypted challenge + CSR for a new application key\n+ the AK's certification that the key was made in this TPM",
       fillcolor="#ece0f2",
       color="#7d5b92"
     ];
 
-    s6 [
-      label="6.  vault write auth/approle/login\nrole_id (public) + secret_id",
-      fillcolor="#ece0f2",
-      color="#7d5b92"
-    ];
-
-    tok [
-      label="device-enrol token\nexactly one capability:\nupdate on pki/sign/devices\nttl 5m / max 10m / 3 uses",
+    blobs [
+      label="on disk: app.blob, ak.blob\nJSON handles: public area +\nprivate area sealed to this TPM\n— not usable private keys",
       shape=note,
       style="filled",
-      fillcolor="#f7f0fa",
-      color="#7d5b92",
+      fillcolor="#f3f8f2",
+      color="#5f8a57",
       fontsize=10
     ];
 
-    s5 -> s6 [color="#7d5b92"];
-    s6 -> tok [color="#7d5b92"];
+    s3 -> s4 [label="encrypted\nchallenge", color="#7d5b92", fontcolor="#5b3f6c"];
+    s4 -> s5 [label="secret", color="#5f8a57", fontcolor="#3f5f39"];
+    s5 -> blobs [style=dotted, color="#5f8a57"];
   }
 
-  // ------------------------------------------------------------ 7. Vault signs
-  s7 [
-    label="7.  vault write pki/sign/devices\nVault PKI issues node01.crt\nCN=node01.devices.lab.local",
+  // -------------------------------------------------------- 6. Vault issues
+  s6 [
+    label="6.  the mount's internal CA issues client.crt\nCN=node01.devices.lab.local\nSAN: tpm_id = sha256-…, role = devices",
     fillcolor="#ece0f2",
     color="#7d5b92"
   ];
 
-  // -------------------------------------------------------------- 8. handshake
-  s8 [
-    label="8.  openssl s_client mTLS handshake\nTPM computes the CertificateVerify signature\nprivate key never crosses the TPM boundary",
+  // ---------------------------------------------------------- 7. handshake
+  s7 [
+    label="7.  vault login -method=tpm\nmTLS handshake signed inside the TPM with the application key\nthe private key never crosses the TPM boundary",
     fillcolor="#fdf0da",
     color="#b5883f"
   ];
 
-  // ------------------------------------------------------------- 9. validation
+  // --------------------------------------------------------- 8. validation
   chk1 [
-    label="9a.  chains to the\ndevice CA?",
+    label="8a.  issued by this\nmount's own CA?",
     shape=diamond,
     style="filled",
     fillcolor="#ece0f2",
@@ -153,7 +142,7 @@ digraph enrolment {
   ];
 
   chk2 [
-    label="9b.  CN matches\n*.devices.lab.local?",
+    label="8b.  TPM ID in the SAN\ntrusted by the role?",
     shape=diamond,
     style="filled",
     fillcolor="#ece0f2",
@@ -163,66 +152,64 @@ digraph enrolment {
   ];
 
   deny [
-    label="login refused\nno token issued\n(Parts 8.2 – 8.4)",
+    label="login refused\nno token issued\n(Parts 8.3 – 8.4)",
     style="rounded,filled,dashed",
     fillcolor="#f8ecec",
     color="#a35b5b",
     fontcolor="#6d3535"
   ];
 
-  // ----------------------------------------------------------------- 10. token
-  s10 [
-    label="10.  token issued\npolicies: default, device-read\nttl 15m / max 1h",
+  // ------------------------------------------------------------- 9. token
+  s9 [
+    label="9.  token issued\npolicies: default, device-read\nttl 15m / max 1h — metadata: tpm_id, role, CN",
     fillcolor="#ece0f2",
     color="#7d5b92"
   ];
 
-  // ----------------------------------------------------------------- 11. usage
-  s11read [
-    label="11a.  vault kv get\nsecret/devices/node01\n→ succeeds",
+  // ------------------------------------------------------------- 10. usage
+  s10read [
+    label="10a.  vault kv get\nsecret/devices/node01\n→ succeeds",
     fillcolor="#dcedd9",
     color="#5f8a57"
   ];
 
-  s11write [
-    label="11b.  vault kv put\nsecret/devices/node01\n→ permission denied",
+  s10write [
+    label="10b.  vault kv put\nsecret/devices/node01\n→ permission denied",
     style="rounded,filled,dashed",
     fillcolor="#f8ecec",
     color="#a35b5b",
     fontcolor="#6d3535"
   ];
 
-  // ------------------------------------------------------------------- flow
-  s1 -> s2  [label="TPM handle"];
-  s1 -> blob [label="only a wrapped\nblob", style=dotted, color="#5f8a57", fontcolor="#3f5f39"];
-
-  // the weak link: the wrapping token still has to reach the device somehow
-  wrap -> s5 [
-    lhead=cluster_device,
-    # This edge crosses a cluster boundary, so its label lands where the dashed
-    # line and the Device cluster's border both are. minlen buys vertical room
-    # and the leading spaces push the text clear of the line itself.
-    label="   4.  delivery out of band\n   — the weak link —\n   secure introduction,\n   still unsolved",
+  // ----------------------------------------------------------------- flow
+  s1 -> ekpub [style=dotted, color="#5f8a57"];
+  s1 -> s2 [
+    lhead=cluster_orchestrator,
+    label="   the EK public key travels\n   — the only thing that does;\n   it is public",
+    minlen=2,
+    color="#5f8a57",
+    fontcolor="#3f5f39"
+  ];
+  s2 -> s3 [
+    ltail=cluster_orchestrator, lhead=cluster_device,
+    label="   Vault now knows this TPM.\n   Nothing is delivered to the device:\n   an unregistered EK is refused at step 3 (Part 8.2)",
     minlen=2,
     style=dashed,
-    penwidth=1.4,
-    color="#a35b5b",
-    fontcolor="#6d3535"
+    color="#7d5b92",
+    fontcolor="#5b3f6c"
   ];
 
-  s2  -> s7 [label="node01.csr"];
-  tok -> s7 [label="authorises step 7\nand nothing else", color="#7d5b92", fontcolor="#5b3f6c"];
-
-  s7 -> s8  [label="node01.crt"];
-  s8 -> chk1 [label="cert auth\nvalidates"];
+  s5 -> s6 [label="attestation verified"];
+  s6 -> s7 [label="client.crt"];
+  s7 -> chk1 [label="auth/tpm/login\nvalidates"];
   chk1 -> chk2 [label="yes"];
-  chk2 -> s10  [label="yes"];
+  chk2 -> s9   [label="yes"];
   chk1 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
   chk2 -> deny [label="no", color="#a35b5b", fontcolor="#6d3535", style=dashed];
-  s10 -> s11read;
-  s10 -> s11write [style=dashed, color="#a35b5b"];
+  s9 -> s10read;
+  s9 -> s10write [style=dashed, color="#a35b5b"];
 
-  { rank=same; blob; s1; }
+  { rank=same; ekpub; s1; }
   { rank=same; chk2; deny; }
-  { rank=same; s11read; s11write; }
+  { rank=same; s10read; s10write; }
 }

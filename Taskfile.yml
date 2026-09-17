@@ -1,6 +1,9 @@
 ---
 version: '3'
 
+# Optional host overrides (see .env.template). Missing file is fine.
+dotenv: ['.env']
+
 vars:
   # VM
   NAME: tpm-lab
@@ -13,11 +16,9 @@ vars:
   DEVICE_NAME: node01
   DOMAIN: devices.lab.local
 
-  # Software TPMs: the device TPM, and a second one standing in for a
-  # different machine during the Part 8.1 stolen-key demo.
-  TPM_PORT: "2321"
-  ATTACKER_TPM_PORT: "2331"
-
+  # Two software TPMs run in the VM: the device TPM, and a second one standing
+  # in for a different machine during the Part 8 demos. Each serves a unix
+  # socket inside its state directory; see scripts/lib/common.sh for the paths.
   LAB_DIR: /home/ubuntu/lab
 
   # Host-side scratch. Everything transient this project writes on the Mac goes
@@ -30,6 +31,13 @@ vars:
   # lab's files cannot collide with anything else in the guest.
   VM_STAGE: /tmp/tpm-lab
 
+  # Vault Enterprise private beta binary and licence. Both live in the host's
+  # .bin/ (gitignored — nothing in .bin/ is ever committed) and are pushed into
+  # the VM by `task provision`. Override the paths via .env if needed — the
+  # same names there win over these defaults.
+  VAULT_BIN: '{{.VAULT_BIN | default ".bin/vault_2.2.0-beta1+ent_linux_arm64"}}'
+  VAULT_LICENSE: '{{.VAULT_LICENSE | default ".bin/vault.hclic"}}'
+
 tasks:
   default:
     cmd: task --list
@@ -38,8 +46,8 @@ tasks:
   # Host
   # ==========================================================================
   deps:
-    desc: Check host dependencies (multipass, task, jq, graphviz)
-    cmd: ./scripts/host/deps.sh
+    desc: Check host dependencies (multipass, task, jq, graphviz) and the Vault Enterprise binary
+    cmd: ./scripts/host/deps.sh '{{.VAULT_BIN}}' '{{.VAULT_LICENSE}}'
 
   init:
     desc: One-time project setup — install pre-commit hooks
@@ -129,8 +137,14 @@ tasks:
       - echo "Lab ready. Run 'task demo' for the full walkthrough."
 
   provision:
-    desc: 'Part 1: install TPM tooling and Vault in the VM'
+    desc: 'Part 1: install TPM tooling and Vault Enterprise in the VM'
+    preconditions:
+      - sh: test -f '{{.VAULT_BIN}}'
+        msg: "Vault Enterprise binary not found at {{.VAULT_BIN}} — copy the private beta binary into .bin/ (gitignored) and re-run"
     cmds:
+      # The binary is pushed here, not in _sync: it is ~550 MB and only changes
+      # when a new build lands in .bin/, so it must not ride along on every step.
+      - ./scripts/host/push_vault_bin.sh {{.NAME}} {{.VM_STAGE}} '{{.VAULT_BIN}}' '{{.VAULT_LICENSE}}'
       - task: _run
         vars: {SCRIPT: 00_provision.sh}
 
@@ -138,7 +152,7 @@ tasks:
     desc: 'Part 2: start the software TPMs as systemd units'
     cmds:
       - task: _run
-        vars: {SCRIPT: 10_tpm_unit.sh, ARGS: '{{.TPM_PORT}} {{.ATTACKER_TPM_PORT}}'}
+        vars: {SCRIPT: 10_tpm_unit.sh}
 
   vault:
     desc: 'Part 3: start the Vault dev server (TLS) as a systemd unit'
@@ -147,13 +161,13 @@ tasks:
         vars: {SCRIPT: 20_vault_unit.sh}
 
   config:
-    desc: 'Parts 4-5: configure PKI device CA, KV secret, policy and cert auth'
+    desc: 'Parts 4-5: tpm auth method and its CA, KV secret, policy, device group and role, orchestrator token'
     cmds:
       - task: _run
         vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}}'}
 
   enrol:
-    desc: 'Part 6: create the device key inside the TPM and enrol it with Vault'
+    desc: 'Part 6: register the device TPM with Vault and attest it for a certificate'
     cmds:
       - task: _run
         vars: {SCRIPT: 40_enrol_device.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
@@ -182,7 +196,7 @@ tasks:
         vars: {SCRIPT: 60_privilege.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:nonexportable:
-    desc: Show the key file on disk is a TPM-wrapped blob, not a private key
+    desc: Show the key files on disk are TPM-sealed handles, not private keys
     cmds:
       - task: _run
         vars: {SCRIPT: 45_nonexportable.sh, ARGS: '{{.DEVICE_NAME}}'}
@@ -191,34 +205,34 @@ tasks:
     desc: 'Part 8: every negative test, in order'
     cmds:
       - task: demo:negative:stolen-key
-      - task: demo:negative:no-cert
+      - task: demo:negative:unenrolled-tpm
       - task: demo:negative:untrusted-ca
-      - task: demo:negative:wrong-cn
+      - task: demo:negative:wrong-role
       - task: demo:negative:revoked-token
 
   demo:negative:stolen-key:
-    desc: '8.1: the key blob is useless against a different TPM'
+    desc: '8.1: the key blobs are useless against a different TPM'
     cmds:
       - task: _run
-        vars: {SCRIPT: 70_negative_stolen_key.sh, ARGS: '{{.DEVICE_NAME}} {{.ATTACKER_TPM_PORT}}'}
+        vars: {SCRIPT: 70_negative_stolen_key.sh, ARGS: '{{.DEVICE_NAME}}'}
 
-  demo:negative:no-cert:
-    desc: '8.2: login without a client certificate is rejected'
+  demo:negative:unenrolled-tpm:
+    desc: '8.2: a TPM Vault has not registered is refused at attestation'
     cmds:
       - task: _run
-        vars: {SCRIPT: 71_negative_no_cert.sh}
+        vars: {SCRIPT: 71_negative_unenrolled_tpm.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
 
   demo:negative:untrusted-ca:
-    desc: '8.3: a TPM key alone is not enough — the cert must chain to the device CA'
+    desc: '8.3: a genuinely attested cert from another CA is rejected'
     cmds:
       - task: _run
-        vars: {SCRIPT: 72_negative_untrusted_ca.sh, ARGS: '{{.DOMAIN}}'}
+        vars: {SCRIPT: 72_negative_untrusted_ca.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
 
-  demo:negative:wrong-cn:
-    desc: '8.4: a trusted-CA cert with the wrong common name is rejected'
+  demo:negative:wrong-role:
+    desc: '8.4: a trusted-CA cert bound to a different TPM and role is rejected'
     cmds:
       - task: _run
-        vars: {SCRIPT: 73_negative_wrong_cn.sh}
+        vars: {SCRIPT: 73_negative_wrong_role.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:negative:revoked-token:
     desc: '8.5: a revoked device token can no longer read'
