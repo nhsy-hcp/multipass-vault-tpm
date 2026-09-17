@@ -29,7 +29,18 @@ export VM_STAGE LAB_TMP
 
 # Point mktemp and anything else honouring TMPDIR at the lab's own scratch dir,
 # so nothing this project runs leaves files loose in the system temp directory.
+#
+# In-VM scripts run as root, but every as_lab_user command inherits TMPDIR via
+# runuser, so the lab user must be able to write here too — otherwise anything
+# that honours TMPDIR under as_lab_user (swtpm_setup's cert scratch, mktemp)
+# fails with "Permission denied". Root can still write to a 0700 directory it
+# does not own. Guarded so host-side scripts, where the lab user does not
+# exist, are unaffected.
 mkdir -p "${LAB_TMP}" 2>/dev/null || true
+if [[ ${EUID} -eq 0 ]] && id -u "${LAB_USER}" >/dev/null 2>&1; then
+  chown "${LAB_USER}:${LAB_USER}" "${LAB_TMP}" 2>/dev/null || true
+  chmod 0700 "${LAB_TMP}" 2>/dev/null || true
+fi
 TMPDIR="${LAB_TMP}"
 export TMPDIR
 
