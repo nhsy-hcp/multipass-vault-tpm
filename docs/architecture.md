@@ -66,6 +66,72 @@ Two constraints explain the layout:
 
 ![Enrolment](diagrams/enrolment.png)
 
+The same flow as a sequence. `Operator` holds the root token, `Orchestrator` a scoped
+`enrol-orchestrator` token, and `Device` no token at all — the arrows show where each
+one is on the wire. Parts 4–5 run once at lab build, 6.1–6.3 once per device, and
+Part 7 on every login thereafter.
+
+```mermaid
+sequenceDiagram
+    actor Op as Operator
+    participant Orch as Orchestrator
+    participant Dev as Device
+    participant TPM as TPM
+    participant V as Vault
+
+    Note over Dev: holds no Vault token, ever
+
+    Note over Op,V: Parts 4-5 — task config, once, as root
+    Op->>V: auth enable tpm, write auth/tpm/config
+    V->>V: create the mount's internal CA
+    Op->>V: create the devices TPM group and the role bound to it
+    Op->>V: write the device-read and enrol-orchestrator policies
+    V-->>Op: enrol-orchestrator token, 24h, two paths
+    Op->>Orch: hand over the scoped token
+
+    Note over Dev,TPM: Part 6.1 — read the endorsement key
+    Dev->>TPM: vault tpm ek
+    TPM-->>Dev: EK public key, its private half never leaves the chip
+    Dev->>Orch: EK public key — public, so nothing secret is delivered
+
+    Note over Orch,V: Part 6.2 — registration, scoped token, not root
+    Orch->>V: write identity/tpm name=node01 tpm_ek_public_key=@ek.pub
+    V-->>Orch: tpm_id = sha256 of the EK public key DER
+    Orch->>V: read identity/tpmgroup/name/devices
+    V-->>Orch: the existing member_tpm_ids
+    Orch->>V: write member_tpm_ids = existing + tpm_id
+
+    Note over Dev,V: Part 6.3 — attestation, unauthenticated
+    Dev->>TPM: create a fresh attestation key
+    TPM-->>Dev: AK public area and parameters
+    Dev->>V: gentpmcert/begin with the EK public key and the AK parameters
+    V->>V: is the EK registered, and does the role trust it via the group?
+    V-->>Dev: challenge — a secret encrypted to the EK, bound to the AK name
+    Dev->>TPM: TPM2_ActivateCredential on the challenge
+    TPM-->>Dev: the decrypted secret, only because the AK and EK share this TPM
+    Dev->>TPM: create the application key, have the AK certify it
+    TPM-->>Dev: application key public area, CSR and certification
+    Dev->>V: gentpmcert/finish with the secret, the CSR and the certification
+    V-->>Dev: client.crt from the internal CA, SAN carries the tpm_id and the role
+    Note right of Dev: app.blob and ak.blob on disk are sealed handles, not keys
+
+    Note over Dev,V: Part 7 — mTLS login, every time, still no token
+    Dev->>TPM: flush transient handles
+    Dev->>V: TLS handshake to auth/tpm/login, presenting client.crt
+    Dev->>TPM: sign the handshake transcript with the application key
+    TPM-->>Dev: the signature — the key itself never leaves
+    Dev->>V: the signed handshake completes the connection
+    V->>V: signed by this mount's CA, and is the SAN tpm_id trusted by the role?
+    V-->>Dev: client token — default and device-read, 15m TTL, 1h max
+    Dev->>V: kv get secret/devices/node01
+    V-->>Dev: the secret
+    Dev->>V: kv put secret/devices/node01
+    V-->>Dev: permission denied
+```
+
+The mermaid block above is its own source — unlike `diagrams/*.dot`, it needs no
+`task docs:diagram` step, and GitHub renders it in place.
+
 The trust chain, step by step:
 
 1. **The endorsement key.** `vault tpm ek` reads the EK public key from the TPM and
