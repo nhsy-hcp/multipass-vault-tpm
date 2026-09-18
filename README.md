@@ -53,9 +53,13 @@ task demo    # the narrated walkthrough, including every negative test
 ```
 
 `task all` takes a few minutes on first run; each of its steps is idempotent and
-individually re-runnable. `task demo` takes under a minute. `.env` (seeded by
-`task init`) can override the VM name, the device name and domain, and where the Vault
-binary and licence live.
+individually re-runnable.
+
+`task demo` pauses between parts so there is room to narrate, printing each Vault
+command as it runs; press ⏎ to go on, `q` to stop and be told how to resume.
+`PAUSE=0 task demo` runs it straight through in under a minute. `.env` (seeded by
+`task init`) can override that, the VM name, the device name and domain, and where the
+Vault binary and licence live.
 
 ## All tasks
 

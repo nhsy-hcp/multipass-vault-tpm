@@ -27,6 +27,7 @@ TOKEN="$(as_lab_user jq -r '.auth.client_token' "${LOGIN_JSON}")"
 
 log_info "Confirming the token currently works..."
 before_rc=0
+show_cmd env 'VAULT_TOKEN=<device>' vault kv get -field=message "secret/devices/${DEVICE}"
 as_lab_user env VAULT_TOKEN="${TOKEN}" vault kv get -field=message "secret/devices/${DEVICE}" >/dev/null 2>&1 \
   || before_rc=$?
 
@@ -38,12 +39,13 @@ fi
 report_expect "read succeeds before revocation" "read succeeded"
 
 log_step "Revoking the token as the Vault operator"
-as_lab_user vault token revoke "${TOKEN}" >/dev/null
+vault_run vault token revoke "${TOKEN}" >/dev/null
 log_ok "token revoked"
 
 log_step "Retrying the same read with the revoked token"
 after_rc=0
 after_out=''
+show_cmd env 'VAULT_TOKEN=<device>' vault kv get "secret/devices/${DEVICE}"
 after_out="$(as_lab_user_allow_fail env VAULT_TOKEN="${TOKEN}" \
   vault kv get "secret/devices/${DEVICE}" 2>&1)" || after_rc=$?
 

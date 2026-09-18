@@ -54,7 +54,7 @@ if mount_enabled auth "${TPM_MOUNT}/"; then
   log_detected "the tpm auth method already enabled at auth/${TPM_MOUNT}" "skipping enable"
 else
   log_info "Enabling the tpm auth method at auth/${TPM_MOUNT}"
-  as_lab_user vault auth enable -path="${TPM_MOUNT}" tpm
+  vault_run vault auth enable -path="${TPM_MOUNT}" tpm
   # A fresh mount means a fresh internal CA. Certificates issued by the previous
   # one — still on disk after a Vault restart — look valid but chain to nothing
   # this mount trusts. Clear them so 'task enrol' re-attests instead of keeping
@@ -71,19 +71,19 @@ fi
 # is valid because this mount issued it, and only this mount can. Device
 # certificates default to 24h — re-running 'task enrol' refreshes them.
 log_info "Configuring the internal CA (device certificates live 24h)"
-as_lab_user vault write "auth/${TPM_MOUNT}/config" default_cert_ttl=24h
+vault_run vault write "auth/${TPM_MOUNT}/config" default_cert_ttl=24h
 
 log_step "Verify: auth/${TPM_MOUNT}/config"
-as_lab_user vault read "auth/${TPM_MOUNT}/config"
+vault_run vault read "auth/${TPM_MOUNT}/config"
 
 # --- Part 5: secret, policy, group, role, orchestrator ------------------------
 log_step "Part 5.1: the secret the device should be able to read"
-as_lab_user vault kv put "secret/devices/${DEMO_DEVICE}" \
+vault_run vault kv put "secret/devices/${DEMO_DEVICE}" \
   message="hello from vault, attested by TPM key"
 
 log_step "Part 5.2: least-privilege policy 'device-read'"
 # Read-only on the KV v2 data path. Part 7.3 proves the write is denied.
-as_lab_user vault policy write device-read - <<'EOF'
+vault_run_stdin vault policy write device-read - <<'EOF'
 path "secret/data/devices/*" {
   capabilities = ["read"]
 }
@@ -100,9 +100,9 @@ if as_lab_user vault read -format=json "identity/tpmgroup/name/${TPM_GROUP}" >/d
   log_detected "an existing TPM group '${TPM_GROUP}'" "keeping its members"
 else
   log_info "Creating TPM group '${TPM_GROUP}' (empty until 'task enrol' adds a device)"
-  as_lab_user vault write "identity/tpmgroup" name="${TPM_GROUP}" metadata="domain=${DOMAIN}" >/dev/null
+  vault_run vault write "identity/tpmgroup" name="${TPM_GROUP}" metadata="domain=${DOMAIN}" >/dev/null
 fi
-group_id="$(as_lab_user vault read -field=id "identity/tpmgroup/name/${TPM_GROUP}")"
+group_id="$(vault_run vault read -field=id "identity/tpmgroup/name/${TPM_GROUP}")"
 [[ -n "${group_id}" ]] || die "could not read the id of TPM group '${TPM_GROUP}'"
 log_ok "group ${TPM_GROUP} = ${group_id}"
 
@@ -110,7 +110,7 @@ log_step "Part 5.4: the '${TPM_ROLE}' role (15m token, 1h max)"
 # The trust anchor is the group, not any individual TPM: a device enrolled
 # later is trusted the moment its TPM ID joins the group. 'vault write' is an
 # upsert, so re-running resets the role to the intended shape.
-as_lab_user vault write "auth/${TPM_MOUNT}/role/${TPM_ROLE}" \
+vault_run vault write "auth/${TPM_MOUNT}/role/${TPM_ROLE}" \
   tpmgroup_ids="${group_id}" \
   display_name=tpm-devices \
   token_policies=device-read \
@@ -118,7 +118,7 @@ as_lab_user vault write "auth/${TPM_MOUNT}/role/${TPM_ROLE}" \
   token_max_ttl=1h
 
 log_step "Verify: the tpm auth role"
-as_lab_user vault read "auth/${TPM_MOUNT}/role/${TPM_ROLE}"
+vault_run vault read "auth/${TPM_MOUNT}/role/${TPM_ROLE}"
 
 log_step "Part 5.5: the orchestrator credential that enrols devices"
 # The device side of enrolment needs no Vault credential at all: the
@@ -134,7 +134,7 @@ log_step "Part 5.5: the orchestrator credential that enrols devices"
 # group, or mint tokens. The device-side attestation is what 'task enrol'
 # demonstrates; this is the other half.
 log_info "Writing the '${ORCH_POLICY}' policy (register EKs, admit them to '${TPM_GROUP}')"
-as_lab_user vault policy write "${ORCH_POLICY}" - <<EOF
+vault_run_stdin vault policy write "${ORCH_POLICY}" - <<EOF
 # Register a device's endorsement key. Vault derives the TPM ID from it and
 # returns it in the response, so nothing else needs reading back.
 path "identity/tpm" {
@@ -168,7 +168,7 @@ log_info "Minting the orchestrator token (24h, policy ${ORCH_POLICY})"
 # privilege. 24h outlives any demo session, and a Vault restart kills it sooner.
 #
 # -no-default-policy so the transcript shows exactly the two paths above.
-orch_json="$(as_lab_user vault token create \
+orch_json="$(vault_run vault token create \
   -policy="${ORCH_POLICY}" \
   -no-default-policy \
   -ttl=24h \

@@ -171,6 +171,63 @@ as_lab_user_allow_fail() {
   return "${rc}"
 }
 
+# --- showing the commands ----------------------------------------------------
+# The lab is a demonstration, so the Vault commands that do the work belong on
+# screen. These print the command an operator would type and then run it, from
+# the same argv — unlike a hand-written echo beside the call, which drifts.
+#
+# Narration goes to fd 9, a duplicate of the script's stderr taken here, once.
+# Not stdout: several callers capture a vault command's stdout with $( ) and
+# parse it as JSON. Not plain stderr either: the report_expect callers capture
+# with $( ... 2>&1 ) to quote what Vault said, and a banner inside that capture
+# would be reported as the "actual" outcome. Fd 9 escapes both.
+exec 9>&2
+
+# Render argv as a copy-pasteable command line: quote only what needs quoting,
+# and redact bearer tokens so a pasted transcript stays clean and gitleaks has
+# nothing to find. The dev server's root token is literally 'root' and is not a
+# secret, so it is left alone.
+fmt_cmd() {
+  local out='' arg literal
+  for arg in "$@"; do
+    literal=0
+    case "${arg}" in
+      # The device's placeholder is the opposite of a secret: it is the proof
+      # that no real token was on the wire. Show it.
+      "VAULT_TOKEN=${NO_TOKEN}") ;;
+      # A caller that already labelled its own token, e.g. VAULT_TOKEN=<device>.
+      VAULT_TOKEN=\<*\>)   literal=1 ;;
+      VAULT_TOKEN=*)       arg='VAULT_TOKEN=<redacted>'; literal=1 ;;
+      hvs.*|hvb.*|hvr.*)   arg='<token>';                literal=1 ;;
+    esac
+    if (( literal == 0 )) && [[ ! "${arg}" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+      # Single quotes, not printf %q: an operator is meant to read this and
+      # paste it, and %q renders a sentence as a thicket of backslashes.
+      arg="'${arg//\'/\'\\\'\'}'"
+    fi
+    out+="${arg} "
+  done
+  printf '%s' "${out% }"
+}
+
+show_cmd() { printf '%s  $ %s%s\n' "${_C_BOLD}" "$(fmt_cmd "$@")" "${_C_RESET}" >&9; }
+
+# show_cmd + as_lab_user, in the two flavours the lab already uses.
+vault_run()            { show_cmd "$@"; as_lab_user "$@"; }
+vault_run_allow_fail() { show_cmd "$@"; as_lab_user_allow_fail "$@"; }
+
+# For the policy writes, which read their body on stdin
+# (`vault policy write <name> -`): show the command and the body, then run it.
+vault_run_stdin() {
+  local body line
+  body="$(cat)"
+  show_cmd "$@"
+  while IFS= read -r line; do
+    printf '    %s%s%s\n' "${_C_DIM}" "${line}" "${_C_RESET}" >&9
+  done <<< "${body}"
+  printf '%s\n' "${body}" | as_lab_user "$@"
+}
+
 lab_mkdir() {
   install -d -o "${VM_USER}" -g "${VM_USER}" -m 0755 "$@"
 }
@@ -221,6 +278,14 @@ export NO_TOKEN
 tpm_attest() {
   local sock="$1" state_dir="$2" role="$3" cn="$4" mount="${5:-tpm}"
   local attempt=0 rc out
+  # Shown once, not per attempt: a rate-limit retry runs the same command.
+  show_cmd env "VAULT_TOKEN=${NO_TOKEN}" \
+    vault tpm attest \
+      -role-name="${role}" \
+      -mount-path="auth/${mount}" \
+      -tpm-device-path="${sock}" \
+      -tpm-state-dir="${state_dir}" \
+      -cert-subject-CN="${cn}"
   while :; do
     attempt=$(( attempt + 1 ))
     flush_tpm_contexts "${sock}"

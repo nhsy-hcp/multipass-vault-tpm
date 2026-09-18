@@ -35,7 +35,7 @@ log_detail "  attacker TPM ID: ${att_id}"
 # precondition — Vault has never seen this EK — holds on every run.
 if as_lab_user vault read "identity/tpm/id/${att_id}" >/dev/null 2>&1; then
   log_detected "the attacker TPM registered from an earlier 8.4 run" "deleting the registration as the operator"
-  as_lab_user vault delete "identity/tpm/id/${att_id}" >/dev/null
+  vault_run vault delete "identity/tpm/id/${att_id}" >/dev/null
 fi
 rc=0
 as_lab_user_allow_fail vault read "identity/tpm/id/${att_id}" >/dev/null 2>&1 || rc=$?
@@ -47,7 +47,6 @@ fi
 report_expect "identity/tpm/id/${att_id:0:20}…: not found" "${reg_state}"
 
 log_step "Attempting attestation from the unregistered TPM (no token, as in Part 6)"
-log_detail "  vault tpm attest -role-name=devices -tpm-device-path=${ATTACKER_TPM_SOCK}"
 rc=0
 out="$(tpm_attest "${ATTACKER_TPM_SOCK}" "${ATT_STATE}" devices "${DEVICE}.${DOMAIN}")" || rc=$?
 

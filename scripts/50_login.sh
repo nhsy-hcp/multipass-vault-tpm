@@ -84,6 +84,10 @@ say()          { (( quiet_json )) || log_info "$@"; }
 say_detail()   { (( quiet_json )) || log_detail "$@"; }
 say_step()     { (( quiet_json )) || log_step "$@"; }
 say_ok()       { (( quiet_json )) || log_ok "$@"; }
+# The banner must stay behind quiet_json as well: the Part 8 scripts run this
+# one with --quiet-json and capture the whole process with 2>&1, so fd 9 does
+# not save it there — it is a pipe either way.
+say_cmd()      { (( quiet_json )) || show_cmd "$@"; }
 
 crt="${state_dir}/client.crt"
 [[ -s "${crt}" ]] || die "no certificate at ${crt} — run 'task enrol' first"
@@ -104,7 +108,6 @@ say ''
 # handles a previous login left loaded. See flush_tpm_contexts in common.sh.
 flush_tpm_contexts "${tpm_device}"
 
-say "vault login -method=tpm -no-store role_name=${role} tpm-state-dir=… tpmDevice=…"
 say_detail "  -no-store keeps the device token out of ~/.vault-token, where it would"
 say_detail "  otherwise replace the dev root token the lab shell relies on."
 
@@ -116,6 +119,11 @@ login_args=(-method=tpm -no-store -format=json)
 [[ "${mount}" == "tpm" ]] || login_args+=(-path="${mount}")
 
 rc=0
+say_cmd env "VAULT_TOKEN=${NO_TOKEN}" \
+  vault login "${login_args[@]}" \
+    role_name="${role}" \
+    tpm-state-dir="${state_dir}" \
+    tpmDevice="${tpm_device}"
 as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
   vault login "${login_args[@]}" \
     role_name="${role}" \

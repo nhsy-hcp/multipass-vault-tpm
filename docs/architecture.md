@@ -214,6 +214,87 @@ job; exercising it is not.
 
 `task demo` runs all of the above in order.
 
+### The commands
+
+Every Vault command below is printed by the scripts as they run, from the same argv
+they execute — there is no separate copy to drift. Bearer tokens are redacted on the
+way to the screen; the device's deliberate `VAULT_TOKEN=device-holds-no-token`
+placeholder is not, because showing it is the point.
+
+**Parts 4–5, as the operator** (`task config`, the one step that uses the root token):
+
+```bash
+vault auth enable -path=tpm tpm
+vault write auth/tpm/config default_cert_ttl=24h
+
+vault kv put secret/devices/node01 message='hello from vault, attested by TPM key'
+
+vault policy write device-read - <<'EOF'
+path "secret/data/devices/*" {
+  capabilities = ["read"]
+}
+EOF
+
+vault write identity/tpmgroup name=devices metadata=domain=devices.lab.local
+group_id="$(vault read -field=id identity/tpmgroup/name/devices)"
+
+# The role trusts the group, never individual TPM IDs — see Trust model above.
+vault write auth/tpm/role/devices \
+  tpmgroup_ids="${group_id}" \
+  display_name=tpm-devices \
+  token_policies=device-read \
+  token_ttl=15m \
+  token_max_ttl=1h
+
+vault policy write enrol-orchestrator - <<'EOF'
+path "identity/tpm" {
+  capabilities = ["update"]
+}
+path "identity/tpmgroup/name/devices" {
+  capabilities = ["read", "update"]
+}
+EOF
+
+vault token create -policy=enrol-orchestrator -no-default-policy -ttl=24h \
+  -display-name=enrol-orchestrator
+```
+
+**Part 6, as the device — no token** (`task enrol`, steps 1 and 3):
+
+```bash
+vault tpm ek -tpm-device-path="${TPM_SOCK}" -format=json
+
+vault tpm attest \
+  -role-name=devices \
+  -mount-path=auth/tpm \
+  -tpm-device-path="${TPM_SOCK}" \
+  -tpm-state-dir=~/lab/tpm/node01 \
+  -cert-subject-CN=node01.devices.lab.local
+```
+
+**Part 6.2, as the orchestrator — scoped token, not root:**
+
+```bash
+vault write identity/tpm name=node01 tpm_ek_public_key=@ek.pub \
+  metadata=domain=devices.lab.local
+
+# A group write replaces the member list, so it is read-modify-write.
+vault read -format=json identity/tpmgroup/name/devices
+vault write identity/tpmgroup/name/devices member_tpm_ids="${existing},${tpm_id}"
+```
+
+**Part 7, as the device — no token:**
+
+```bash
+vault login -method=tpm -no-store -format=json \
+  role_name=devices \
+  tpm-state-dir=~/lab/tpm/node01 \
+  tpmDevice="${TPM_SOCK}"
+```
+
+`-no-store` keeps the device token out of `~/.vault-token`, where it would otherwise
+replace the dev root token the lab shell relies on.
+
 > **On the rejection messages.** 8.2 is specific: `no TPM found for EK public key`.
 > 8.3 and 8.4 both return `authentication failed` from `auth/tpm/login` — Vault does not
 > say whether the chain or the role binding failed, so the two cases are distinguished
@@ -292,13 +373,32 @@ stolen-key test never requires stopping and restarting the real one.
 | `task demo:login` | The mTLS login | A client token with policies `default` and `device-read`, and metadata naming the TPM |
 | `task demo:privilege` | Read then write with the device token | Read succeeds, write is denied |
 | `task demo:negative` | All five negative tests in order | Each prints its expected and actual outcome for the operator to judge |
-| `task demo` | The complete narrated run | Roughly a minute |
+| `task demo` | The complete narrated run | Pauses between parts; about a minute with `PAUSE=0` |
 | `task shell` | Interactive shell in the VM | `source ~/lab/env.sh` to work by hand |
 | `task logs`, `task logs:tpm`, `task logs:vault` | Journals for the lab units | |
 | `task reset` | Clears lab state and both TPMs' seeds, keeps the VM, the binary and the licence | Rebuild with `task tpm vault config enrol` |
 | `task clean` / `task rebuild` | Destroy the VM / destroy and rebuild | |
 | `task lint` | pre-commit: shellcheck, gitleaks | Must pass before committing |
 | `task docs:diagram` | Re-renders both PNGs from the `.dot` sources | Needs graphviz on the host |
+
+### Pacing the demo
+
+`task demo` stops between each part and waits, so there is room to talk over what just
+happened before the next thing scrolls past:
+
+```
+────────────────────────────────────────────────────────────
+next: Part 8 — the five negative tests
+  ⏎ continue · q quit
+```
+
+`q` stops the run and prints the task to resume with, so a session can be picked up
+where it was left. `PAUSE=0 task demo` restores the uninterrupted run, and `PAUSE=0` in
+`.env` makes that permanent. The prompt is host-side (`scripts/host/pause.sh`) and reads
+`/dev/tty` directly: with no terminal — a pipe, CI — it is skipped rather than blocking.
+
+Pauses sit between the demo tasks, not inside them. Running one part on its own
+(`task demo:login`) never prompts.
 
 ## Troubleshooting
 

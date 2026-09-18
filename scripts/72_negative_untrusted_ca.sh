@@ -35,11 +35,11 @@ log_info ""
 if mount_enabled auth "${ROGUE_MOUNT}/"; then
   log_detected "the ${ROGUE_MOUNT} mount already enabled" "reusing it"
 else
-  as_lab_user vault auth enable -path="${ROGUE_MOUNT}" tpm >/dev/null
+  vault_run vault auth enable -path="${ROGUE_MOUNT}" tpm >/dev/null
   log_ok "enabled auth/${ROGUE_MOUNT} — it generated its own CA on the spot"
 fi
-as_lab_user vault write "auth/${ROGUE_MOUNT}/config" default_cert_ttl=1h >/dev/null
-as_lab_user vault write "auth/${ROGUE_MOUNT}/role/devices" tpm_ids="${tpm_id}" token_policies=default >/dev/null
+vault_run vault write "auth/${ROGUE_MOUNT}/config" default_cert_ttl=1h >/dev/null
+vault_run vault write "auth/${ROGUE_MOUNT}/role/devices" tpm_ids="${tpm_id}" token_policies=default >/dev/null
 log_ok "auth/${ROGUE_MOUNT}/role/devices trusts ${tpm_id:0:20}…"
 
 log_step "Attesting the device TPM against auth/${ROGUE_MOUNT} (a real attestation)"

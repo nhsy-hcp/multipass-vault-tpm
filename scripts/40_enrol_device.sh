@@ -75,12 +75,12 @@ redact() {
 
 # --- 6.1 device: the endorsement key ----------------------------------------
 log_step "6.1 (DEVICE, no token): read the endorsement key from the TPM"
-log_detail "  vault tpm ek -tpm-device-path=${TPM_SOCK}"
 log_detail "  The EK is created from a seed burned into the TPM at manufacture. Its"
 log_detail "  private half never leaves the chip; the public half is the device's identity."
 
 flush_tpm_contexts
 rc=0
+show_cmd env "VAULT_TOKEN=${NO_TOKEN}" vault tpm ek -tpm-device-path="${TPM_SOCK}" -format=json
 ek_json="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
   vault tpm ek -tpm-device-path="${TPM_SOCK}" -format=json 2>"${ERR_LOG}")" || rc=$?
 (( rc == 0 )) || die "could not read the EK (vault exit ${rc}): $(vault_error) — is swtpm@device running? ('task logs:tpm')"
@@ -111,10 +111,18 @@ orch_token="$(<"${ORCH_TOKEN_FILE}")"
 [[ -n "${orch_token}" ]] || die "${ORCH_TOKEN_FILE} is empty — re-run 'task config'"
 log_detail "orchestrator token $(redact "${orch_token}") — policy 'enrol-orchestrator', two paths, nothing else"
 
+# Run a vault command with the orchestrator's token, showing it as
+# VAULT_TOKEN=<orchestrator>: which of the three identities is on the wire is
+# the whole point of 6.2, and naming it says more than a redaction would.
+# Same shape as vault_as_device in scripts/60_privilege.sh.
+as_orchestrator() {
+  show_cmd env 'VAULT_TOKEN=<orchestrator>' "$@"
+  as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" "$@"
+}
+
 log_info "Registering the EK as '${DEVICE}' in identity/tpm"
-log_detail "  VAULT_TOKEN=<orchestrator> vault write identity/tpm name=${DEVICE} tpm_ek_public_key=@ek.pub"
 rc=0
-reg_json="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
+reg_json="$(as_orchestrator \
   vault write -format=json identity/tpm \
   name="${DEVICE}" tpm_ek_public_key=@"${EK_PUB}" metadata="domain=${DOMAIN}" 2>"${ERR_LOG}")" || rc=$?
 (( rc == 0 )) || die "could not register the EK as the orchestrator (vault exit ${rc}): $(vault_error)"
@@ -125,7 +133,7 @@ log_ok "identity/tpm/name/${DEVICE} = ${reg_id} (an upsert: re-running changes n
 
 log_info "Admitting ${tpm_id} to TPM group '${TPM_GROUP}'"
 rc=0
-group_json="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
+group_json="$(as_orchestrator \
   vault read -format=json "identity/tpmgroup/name/${TPM_GROUP}" 2>"${ERR_LOG}")" || rc=$?
 (( rc == 0 )) || die "could not read group '${TPM_GROUP}' as the orchestrator (vault exit ${rc}): $(vault_error) — run 'task config' first"
 members="$(printf '%s' "${group_json}" | jq -r '.data.member_tpm_ids // [] | join(",")')"
@@ -135,7 +143,7 @@ else
   # A group write replaces the member list, so it is read-modify-write.
   new_members="${members:+${members},}${tpm_id}"
   rc=0
-  as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
+  as_orchestrator \
     vault write "identity/tpmgroup/name/${TPM_GROUP}" member_tpm_ids="${new_members}" >/dev/null 2>"${ERR_LOG}" || rc=$?
   (( rc == 0 )) || die "could not admit the TPM to '${TPM_GROUP}' (vault exit ${rc}): $(vault_error)"
   log_ok "group '${TPM_GROUP}' now trusts ${tpm_id}"
@@ -145,8 +153,7 @@ fi
 # the calls tolerate it and the script reports rather than aborts.
 log_info "What the orchestrator cannot do:"
 rc=0
-deny_out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
-  vault read "${TPM_ROLE}" 2>&1)" || rc=$?
+deny_out="$(as_orchestrator vault read "${TPM_ROLE}" 2>&1)" || rc=$?
 if (( rc != 0 )) && printf '%s' "${deny_out}" | grep -qiE 'permission denied|Code: 403'; then
   report_expect "read ${TPM_ROLE}: permission denied" "permission denied (vault exit ${rc})"
 else
@@ -154,8 +161,7 @@ else
   log_warn "the orchestrator can see the auth role — its policy is wider than intended"
 fi
 rc=0
-deny_out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${orch_token}" \
-  vault kv get "secret/devices/${DEVICE}" 2>&1)" || rc=$?
+deny_out="$(as_orchestrator vault kv get "secret/devices/${DEVICE}" 2>&1)" || rc=$?
 if (( rc != 0 )) && printf '%s' "${deny_out}" | grep -qiE 'permission denied|Code: 403'; then
   report_expect "read the device secret: permission denied" "permission denied (vault exit ${rc})"
 else
@@ -181,7 +187,6 @@ cert_current() {
 if cert_current; then
   log_detected "a valid certificate for ${tpm_id} / role ${ROLE_NAME} in ${DEVICE_DIR}" "skipping attestation (delete ${DEVICE_DIR} or run 'task reset' to force it)"
 else
-  log_info "vault tpm attest -role-name=${ROLE_NAME} -tpm-device-path=${TPM_SOCK} -tpm-state-dir=${DEVICE_DIR}"
   log_detail "  1. begin:  the device sends its EK public key and a fresh attestation key (AK);"
   log_detail "             Vault looks the EK up, checks the role trusts it, and returns a"
   log_detail "             secret encrypted so that only that EK can unwrap it — bound to the AK."

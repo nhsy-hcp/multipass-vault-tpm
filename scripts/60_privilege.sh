@@ -47,6 +47,9 @@ log_detail "using the device token from ${LOGIN_JSON} (${token:0:12}...), not th
 # "actual" half of the pair; failure is never fatal here.
 vault_as_device() {
   local rc=0 out
+  # Shown before the capture below, and labelled rather than redacted: which
+  # identity is on the wire is what this part is about.
+  show_cmd env 'VAULT_TOKEN=<device>' "$@"
   out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${token}" "$@" 2>&1)" || rc=$?
   printf '%s' "${out}"
   return "${rc}"
@@ -58,7 +61,6 @@ first_line() { printf '%s\n' "$1" | grep -m1 -v '^[[:space:]]*$' || printf '(no 
 # --- 1. who is this token? ---------------------------------------------------
 log_info ""
 log_info "1. Look the token up — who does Vault think we are?"
-log_detail "   VAULT_TOKEN=<device> vault token lookup"
 
 rc=0
 lookup="$(vault_as_device vault token lookup -format=json)" || rc=$?
@@ -81,7 +83,6 @@ fi
 # --- 2. the read it is entitled to -------------------------------------------
 log_info ""
 log_info "2. Read the device secret — inside the policy."
-log_detail "   VAULT_TOKEN=<device> vault kv get ${SECRET_PATH}"
 
 rc=0
 read_out="$(vault_as_device vault kv get -format=json "${SECRET_PATH}")" || rc=$?
@@ -96,7 +97,6 @@ fi
 # --- 3. the write it is not ---------------------------------------------------
 log_info ""
 log_info "3. Write to the same path — outside the policy. This should be refused."
-log_detail "   VAULT_TOKEN=<device> vault kv put ${SECRET_PATH} message=tampered"
 
 rc=0
 write_out="$(vault_as_device vault kv put "${SECRET_PATH}" message=tampered)" || rc=$?

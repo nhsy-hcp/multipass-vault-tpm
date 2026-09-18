@@ -179,11 +179,23 @@ tasks:
   # Demo
   # ==========================================================================
   demo:
-    desc: Run the full narrated demonstration (Parts 6-8)
+    desc: Run the full narrated demonstration (Parts 6-8), pausing between parts
     cmds:
       - task: demo:nonexportable
+      - task: _pause
+        vars:
+          NEXT: 'Part 7 — log in to Vault with the TPM-held key'
+          RESUME: demo:login
       - task: demo:login
+      - task: _pause
+        vars:
+          NEXT: 'Part 7.3 — least privilege: the read succeeds, the write is denied'
+          RESUME: demo:privilege
       - task: demo:privilege
+      - task: _pause
+        vars:
+          NEXT: 'Part 8 — the five negative tests'
+          RESUME: demo:negative
       - task: demo:negative
 
   demo:login:
@@ -205,12 +217,28 @@ tasks:
         vars: {SCRIPT: 45_nonexportable.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:negative:
-    desc: 'Part 8: every negative test, in order'
+    desc: 'Part 8: every negative test, in order, pausing between them'
     cmds:
       - task: demo:negative:stolen-key
+      - task: _pause
+        vars:
+          NEXT: '8.2 — an unregistered TPM is refused at attestation'
+          RESUME: demo:negative:unenrolled-tpm
       - task: demo:negative:unenrolled-tpm
+      - task: _pause
+        vars:
+          NEXT: '8.3 — a genuinely attested certificate from another CA is rejected'
+          RESUME: demo:negative:untrusted-ca
       - task: demo:negative:untrusted-ca
+      - task: _pause
+        vars:
+          NEXT: '8.4 — a trusted-CA certificate bound to a different TPM and role is rejected'
+          RESUME: demo:negative:wrong-role
       - task: demo:negative:wrong-role
+      - task: _pause
+        vars:
+          NEXT: '8.5 — a revoked token can no longer read'
+          RESUME: demo:negative:revoked-token
       - task: demo:negative:revoked-token
 
   demo:negative:stolen-key:
@@ -286,6 +314,24 @@ tasks:
       - multipass exec {{.NAME}} -- mkdir -p {{.VM_STAGE}}
       - multipass transfer ./scripts/lib/common.sh {{.NAME}}:{{.VM_STAGE}}/common.sh
       - multipass transfer ./scripts/*.sh {{.NAME}}:{{.VM_STAGE}}/
+
+  # Pause between demo parts so the operator can narrate. Host-side on purpose:
+  # the prompt needs a terminal, and the Mac's is the only one reliably in the
+  # path — see the comment at the top of scripts/host/pause.sh.
+  #
+  # PAUSE=1 is the default for the demo; PAUSE=0 restores the uninterrupted
+  # run. Declaring it under env: means both `PAUSE=0 task demo` and
+  # `task demo PAUSE=0` work, and .env can set it for good.
+  _pause:
+    internal: true
+    interactive: true
+    run: always
+    requires:
+      vars: [NEXT]
+    env:
+      PAUSE: '{{.PAUSE | default "1"}}'
+    cmds:
+      - ./scripts/host/pause.sh '{{.NEXT}}' '{{.RESUME}}'
 
   _run:
     internal: true

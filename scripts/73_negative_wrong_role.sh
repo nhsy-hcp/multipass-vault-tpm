@@ -30,14 +30,14 @@ log_info ""
 
 # Operator work: registering a second, legitimate device. Root is appropriate.
 flush_tpm_contexts "${ATTACKER_TPM_SOCK}"
-ek_json="$(as_lab_user env "VAULT_TOKEN=${NO_TOKEN}" vault tpm ek -tpm-device-path="${ATTACKER_TPM_SOCK}" -format=json)"
+ek_json="$(vault_run env "VAULT_TOKEN=${NO_TOKEN}" vault tpm ek -tpm-device-path="${ATTACKER_TPM_SOCK}" -format=json)"
 att_id="$(printf '%s' "${ek_json}" | jq -r '.tpm_id // empty')"
 [[ -n "${att_id}" ]] || die "could not read the attacker TPM's EK"
 printf '%s' "${ek_json}" | jq -r '.tpm_ek_public_key' | write_lab_file "${ATT_STATE}/ek.pub"
 printf '%s\n' "${att_id}" | write_lab_file "${ATT_STATE}/tpm_id"
 
-as_lab_user vault write identity/tpm name="${OTHER_NAME}" tpm_ek_public_key=@"${ATT_STATE}/ek.pub" >/dev/null
-as_lab_user vault write "auth/tpm/role/${OTHER_ROLE}" tpm_ids="${att_id}" token_policies=default token_ttl=5m >/dev/null
+vault_run vault write identity/tpm name="${OTHER_NAME}" tpm_ek_public_key=@"${ATT_STATE}/ek.pub" >/dev/null
+vault_run vault write "auth/tpm/role/${OTHER_ROLE}" tpm_ids="${att_id}" token_policies=default token_ttl=5m >/dev/null
 log_ok "registered ${OTHER_NAME} = ${att_id:0:20}…, trusted by role '${OTHER_ROLE}' only"
 
 log_step "Attesting the second TPM against role '${OTHER_ROLE}' (a real attestation)"

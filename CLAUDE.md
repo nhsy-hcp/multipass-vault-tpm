@@ -61,7 +61,7 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 
 | Task | Purpose |
 |---|---|
-| `demo` | The full narrated run (Parts 6–8) |
+| `demo` | The full narrated run (Parts 6–8), pausing between parts — `PAUSE=0 task demo` runs it straight through |
 | `demo:nonexportable` | The key files are TPM-sealed handles, not private keys |
 | `demo:login` | Part 7: mTLS login with the TPM-held key |
 | `demo:privilege` | Part 7.3: read succeeds, write denied |
@@ -103,6 +103,26 @@ Run `task --list` for the authoritative version. Grouped by purpose:
   carry no `LAB_` prefix: `VM_USER`, `VM_DIR`, `STATE_DIR`, `TLS_DIR`, `TPM_DIR`,
   `SCRATCH_DIR`. Device attest directories are `DEVICE_DIR` locals, never `STATE_DIR`. TPM key blobs must be created by the same user that will
   later use them, and lab artefacts must not end up root-owned.
+- **Show the command, never retype it.** Vault commands go through `vault_run`,
+  `vault_run_allow_fail` or `vault_run_stdin` (the heredoc policy writes), which print
+  the argv they are about to run via `show_cmd`/`fmt_cmd`. A hand-written `log_detail`
+  beside a call drifts from it — `50_login.sh` was printing `tpm-state-dir=…` while
+  running something else. Where the token matters more than the command, wrap it
+  locally and label the identity: `as_orchestrator` in `40_enrol_device.sh`,
+  `vault_as_device` in `60_privilege.sh`. `fmt_cmd` redacts real bearer tokens but
+  deliberately shows `VAULT_TOKEN=device-holds-no-token`.
+  Narration is written to **fd 9**, a duplicate of stderr taken once in `common.sh` —
+  not stdout (callers parse it as JSON) and not stderr (the `report_expect` callers
+  capture `2>&1` and would report the banner as the "actual" outcome). Probes —
+  `mount_enabled`, readiness `vault status`, `vault read … >/dev/null 2>&1` existence
+  checks — stay on plain `as_lab_user`: show what configures or demonstrates, not what
+  merely looks.
+- **Pausing is host-side.** `task demo` pauses between parts via the internal `_pause`
+  task and `scripts/host/pause.sh`, gated on `PAUSE` (default 1). It must stay on the
+  host: `multipass exec` has no pty flag and gets stdin only when its caller had one,
+  and Parts 8.1/8.3/8.4 capture `50_login.sh … 2>&1`, so an in-VM prompt could be
+  swallowed. The script reads `/dev/tty` on its own fd and skips rather than blocks
+  when there is no terminal — never let a pause hang CI.
 - **One socket per TPM.** Each swtpm serves `~/lab/tpmstate/<instance>/swtpm.sock`
   (plus a `.ctrl` socket for the swtpm TCTI). tpm2-tools use
   `TPM2TOOLS_TCTI=swtpm:path=<sock>`; the Vault CLI uses `-tpm-device-path=<sock>` /
