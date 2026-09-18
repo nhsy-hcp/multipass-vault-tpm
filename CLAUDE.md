@@ -187,7 +187,14 @@ Run `task --list` for the authoritative version. Grouped by purpose:
   present the device's blobs to a TPM with a different storage seed (8.1), attest from an
   EK Vault has never seen (8.2), and act as a legitimate device of another role (8.4).
   It must keep its own state directory and must never share a seed with `swtpm@device`.
-  8.2 deletes any registration 8.4 left behind, so the two can run in either order.
+  8.2 and 8.4 keep separate state directories (`unenrolled`, `attacker`) so neither
+  inherits the other's certificate.
+- **The Part 8 tests undo their own Vault state.** 8.3 disables `auth/tpm-rogue` and 8.4
+  deletes `node99` and `auth/tpm/role/other`, both from an `EXIT` trap armed before the
+  writes, so an aborted run cleans up too. Without that the mount accumulates scaffolding
+  nobody configured, visible in `vault auth list` for the rest of the demo. 8.2 still
+  deletes any 8.4 registration defensively, for a run killed before its trap fired — keep
+  that, and keep the traps.
 - **8.3 uses a second tpm auth mount** (`auth/tpm-rogue`) as the "untrusted CA": same
   TPM, same EK, a real attestation, a different internal CA. A mount refuses attestation
   until its `config` has been written once, even though every field has a default.

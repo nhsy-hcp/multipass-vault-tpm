@@ -95,7 +95,10 @@ log_ok "EK public key at ${EK_PUB}; TPM ID ${tpm_id}"
 
 # The TPM ID is nothing more than the SHA-256 of the EK public key's DER
 # encoding. Recomputing it locally shows there is no hidden registry value.
-computed="$(as_lab_user openssl pkey -pubin -in "${EK_PUB}" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)"
+rc=0
+computed="$(as_lab_user_allow_fail openssl pkey -pubin -in "${EK_PUB}" -outform DER 2>/dev/null \
+  | sha256sum | cut -d' ' -f1)" || rc=$?
+(( rc == 0 )) || die "could not compute the SHA-256 of ${EK_PUB} (openssl exit ${rc}) — is it a valid public key?"
 report_expect "sha256-${computed} (sha256 of the EK public key, computed locally)" "${tpm_id}"
 [[ "${tpm_id}" == "sha256-${computed}" ]] || log_warn "the TPM ID is not the SHA-256 of the PEM's DER — check how this build derives it"
 
@@ -151,23 +154,36 @@ fi
 
 # The scope of that token, demonstrated. Failure is the expected outcome, so
 # the calls tolerate it and the script reports rather than aborts.
+#
+# Three outcomes, not two. A denial is the point; a *different* failure — Vault
+# unreachable, the path gone after a dev-server restart — is not evidence about
+# the policy either way, and must not be reported as one. Only a call that
+# actually succeeds means the policy is wider than intended.
+expect_denied() {
+  local what="$1" wider="$2"; shift 2
+  local rc=0 out first
+  out="$(as_orchestrator "$@" 2>&1)" || rc=$?
+  first="$(printf '%s\n' "${out}" | grep -m1 -v '^[[:space:]]*$' || true)"
+
+  if (( rc == 0 )); then
+    report_expect "${what}: permission denied" "SUCCEEDED — the call was allowed"
+    log_warn "${wider}"
+  elif printf '%s' "${out}" | grep -qiE 'permission denied|Code: 403'; then
+    report_expect "${what}: permission denied" "permission denied (vault exit ${rc})"
+  else
+    report_expect "${what}: permission denied" \
+      "failed for another reason (vault exit ${rc}): ${first}"
+    log_warn "that is not a denial — check Vault is up before reading anything into it"
+  fi
+}
+
 log_info "What the orchestrator cannot do:"
-rc=0
-deny_out="$(as_orchestrator vault read "${TPM_ROLE}" 2>&1)" || rc=$?
-if (( rc != 0 )) && printf '%s' "${deny_out}" | grep -qiE 'permission denied|Code: 403'; then
-  report_expect "read ${TPM_ROLE}: permission denied" "permission denied (vault exit ${rc})"
-else
-  report_expect "read ${TPM_ROLE}: permission denied" "$(printf '%s\n' "${deny_out}" | grep -m1 -v '^[[:space:]]*$' || printf 'SUCCEEDED')"
-  log_warn "the orchestrator can see the auth role — its policy is wider than intended"
-fi
-rc=0
-deny_out="$(as_orchestrator vault kv get "secret/devices/${DEVICE}" 2>&1)" || rc=$?
-if (( rc != 0 )) && printf '%s' "${deny_out}" | grep -qiE 'permission denied|Code: 403'; then
-  report_expect "read the device secret: permission denied" "permission denied (vault exit ${rc})"
-else
-  report_expect "read the device secret: permission denied" "$(printf '%s\n' "${deny_out}" | grep -m1 -v '^[[:space:]]*$' || printf 'SUCCEEDED')"
-  log_warn "the orchestrator can read secrets — its policy is wider than intended"
-fi
+expect_denied "read ${TPM_ROLE}" \
+  "the orchestrator can see the auth role — its policy is wider than intended" \
+  vault read "${TPM_ROLE}"
+expect_denied "read the device secret" \
+  "the orchestrator can read secrets — its policy is wider than intended" \
+  vault kv get "secret/devices/${DEVICE}"
 
 # --- 6.3 device: attest -------------------------------------------------------
 log_step "6.3 (DEVICE, no token): attest — prove possession of the EK, get a certificate"

@@ -26,6 +26,19 @@ require_cmd jq openssl || die "missing prerequisites"
 tpm_id="$(<"${DEVICE_DIR}/tpm_id")"
 lab_mkdir "${TPM_DIR}" "${ROGUE_STATE}"
 
+# auth/tpm-rogue exists only to be a second CA for the length of this script.
+# Left enabled it shows up in `vault auth list` for the rest of the demo, as a
+# tpm mount nobody configured, so it goes when the script does — on the way
+# out of a successful run and an aborted one alike.
+cleanup_rogue_mount() {
+  mount_enabled auth "${ROGUE_MOUNT}/" || return 0
+  log_info ""
+  log_detected "the ${ROGUE_MOUNT} stand-in mount still enabled" "disabling it so the demo leaves no trace"
+  vault_run_allow_fail vault auth disable "${ROGUE_MOUNT}" >/dev/null 2>&1 \
+    || log_warn "could not disable auth/${ROGUE_MOUNT} — remove it by hand"
+}
+trap cleanup_rogue_mount EXIT
+
 log_info "A second tpm auth mount stands in for an unrelated CA. Same Vault, same"
 log_info "TPM, same registered EK — but a different mount, so a different internal CA."
 log_info ""

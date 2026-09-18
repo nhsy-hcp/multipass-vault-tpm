@@ -30,11 +30,28 @@ log_info ""
 
 # Operator work: registering a second, legitimate device. Root is appropriate.
 flush_tpm_contexts "${ATTACKER_TPM_SOCK}"
-ek_json="$(vault_run env "VAULT_TOKEN=${NO_TOKEN}" vault tpm ek -tpm-device-path="${ATTACKER_TPM_SOCK}" -format=json)"
+rc=0
+ek_json="$(vault_run_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
+  vault tpm ek -tpm-device-path="${ATTACKER_TPM_SOCK}" -format=json 2>&1)" || rc=$?
+(( rc == 0 )) || die "could not read the attacker TPM's EK (vault exit ${rc}): $(printf '%s\n' "${ek_json}" | tail -1) — is swtpm@attacker running? ('task logs:tpm')"
 att_id="$(printf '%s' "${ek_json}" | jq -r '.tpm_id // empty')"
-[[ -n "${att_id}" ]] || die "could not read the attacker TPM's EK"
+[[ -n "${att_id}" ]] || die "vault tpm ek returned no TPM ID for the attacker TPM"
 printf '%s' "${ek_json}" | jq -r '.tpm_ek_public_key' | write_lab_file "${ATT_STATE}/ek.pub"
 printf '%s\n' "${att_id}" | write_lab_file "${ATT_STATE}/tpm_id"
+
+# Props, not lab state. Without this the mount keeps an extra role bound to a
+# TPM whose registration 8.2 later deletes — a dangling role for anyone who
+# runs `vault list auth/tpm/role` during the rest of the demo. 8.2 still
+# deletes the registration defensively, for a run that was killed mid-flight.
+cleanup_other_device() {
+  log_info ""
+  log_detected "the ${OTHER_NAME} registration and role '${OTHER_ROLE}'" "removing this test's props from the mount"
+  vault_run_allow_fail vault delete "auth/tpm/role/${OTHER_ROLE}" >/dev/null 2>&1 \
+    || log_warn "could not delete auth/tpm/role/${OTHER_ROLE} — remove it by hand"
+  vault_run_allow_fail vault delete "identity/tpm/id/${att_id}" >/dev/null 2>&1 \
+    || log_warn "could not delete identity/tpm/id/${att_id} — remove it by hand"
+}
+trap cleanup_other_device EXIT
 
 vault_run vault write identity/tpm name="${OTHER_NAME}" tpm_ek_public_key=@"${ATT_STATE}/ek.pub" >/dev/null
 vault_run vault write "auth/tpm/role/${OTHER_ROLE}" tpm_ids="${att_id}" token_policies=default token_ttl=5m >/dev/null

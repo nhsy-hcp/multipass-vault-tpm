@@ -297,10 +297,16 @@ tpm_attest() {
         -tpm-device-path="${sock}" \
         -tpm-state-dir="${state_dir}" \
         -cert-subject-CN="${cn}" 2>&1)" || rc=$?
-    if (( rc != 0 )) && (( attempt < 4 )) && printf '%s' "${out}" | grep -qi 'rate limit'; then
-      log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying (attempt ${attempt})" >&2
-      sleep 12
-      continue
+    if (( rc != 0 )) && printf '%s' "${out}" | grep -qi 'rate limit'; then
+      if (( attempt < 4 )); then
+        log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying (attempt ${attempt})" >&2
+        sleep 12
+        continue
+      fi
+      # Out of retries and still rate-limited. The caller is about to report
+      # this refusal under whatever label it expected to prove, so say plainly
+      # that the rate limit, not the thing under test, is what refused.
+      log_warn "still rate-limited after ${attempt} attempts — this refusal is the rate limit, not the outcome under test"
     fi
     printf '%s\n' "${out}"
     return "${rc}"

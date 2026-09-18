@@ -48,6 +48,13 @@ Options:
 USAGE
 }
 
+# Help is checked before the positional guard below, which rejects anything
+# starting with '-' and would otherwise send `50_login.sh --help` to stderr
+# with exit 1 — the option loop never sees a first argument.
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
 device="${1:-}"
 [[ -n "${device}" && "${device}" != -* ]] || { usage >&2; exit 1; }
 shift
