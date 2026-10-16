@@ -1,19 +1,24 @@
-# Vault TPM-Backed Cert Auth Lab
+# Vault TPM Auth Lab
 
-A self-contained lab that shows a machine authenticating to HashiCorp Vault with a TLS
-client certificate whose private key was generated **inside a TPM** and can never be
-exported from it. Vault's PKI engine signs the device's CSR, the cert auth method
-validates the resulting certificate over mTLS and hands back a short-lived token scoped
-to a single secret. This matters because the usual alternatives — a bearer token in a
-file, or a PEM private key on disk — can be copied off the machine and replayed
-anywhere; a TPM-held key cannot. The lab's negative tests prove it: the same key blob,
-presented against a different TPM, simply fails the handshake.
+A self-contained lab that shows a machine authenticating to HashiCorp Vault with
+**Vault Enterprise's `tpm` auth method**: the device is identified by its TPM's
+endorsement key, it proves possession of that key through an EK/AK attestation, Vault's
+internal CA issues it a client certificate, and every login is an mTLS handshake signed
+inside the TPM by a key that can never be exported. The device holds no Vault token to
+enrol — the silicon is the credential. The lab's negative tests prove it: the same key
+blobs against a different TPM fail the integrity check before the handshake even starts,
+and a TPM Vault has not registered cannot begin attestation at all.
+
+**This lab is for Vault Enterprise only.** The `tpm` auth method is an Enterprise
+feature: the lab installs the GA Vault Enterprise package from HashiCorp's apt repository
+inside the VM, and you supply the licence.
 
 ![Topology](docs/diagrams/topology.png)
 
 ## Prerequisites
 
-Everything runs on a macOS host driving an Ubuntu 24.04 VM via Multipass.
+Everything runs on a macOS host driving an Ubuntu 24.04 VM via Multipass (arm64 on Apple
+Silicon, amd64 on Intel — both work).
 
 | Tool | Why |
 |---|---|
@@ -29,17 +34,34 @@ brew install --cask multipass
 brew install go-task jq graphviz shellcheck gitleaks pre-commit
 ```
 
+One file that is **not** in this repository and never will be:
+
+| File | What it is |
+|---|---|
+| A Vault Enterprise licence | Its text pasted into `.env` as `VAULT_LICENSE` on one line (`task init` seeds `.env` from `.env.template`); `.env` is gitignored |
+
+`task provision` pushes the licence into the VM, skipping the copy on later runs when the
+installed copy already matches, and installs `vault-enterprise` from HashiCorp's apt
+repository at the version pinned by `VAULT_VERSION` (default `2.2.0+ent-1`, overridable
+in `.env`), holding it there so an `apt upgrade` cannot move it.
+
 ## Quick start
 
 ```bash
-task deps    # verify host tooling
+task deps    # verify host tooling and that VAULT_LICENSE is set in .env
 task init    # one-time project setup (pre-commit hooks, .env)
 task all     # launch the VM, provision it, start the TPMs and Vault, enrol node01
-task demo    # the narrated walkthrough, including every negative test
+task demo    # the narrated walkthrough, every negative test, and the Vault Agent
 ```
 
 `task all` takes a few minutes on first run; each of its steps is idempotent and
-individually re-runnable. `task demo` takes under a minute.
+individually re-runnable.
+
+`task demo` pauses between parts so there is room to narrate, printing each Vault
+command as it runs; press ⏎ to go on, `q` to stop and be told how to resume.
+`PAUSE=0 task demo` runs it straight through in under a minute. `.env` (seeded by
+`task init`) can override that, the VM name, the device name and domain, the Vault
+version, and holds the licence.
 
 ## All tasks
 
@@ -48,21 +70,24 @@ task --list
 ```
 
 That is the authoritative catalogue — build steps, individual demo segments,
-`task shell`, and `task logs:tpm` / `task logs:vault` for the two systemd units.
+`task shell`, and `task logs:tpm` / `task logs:vault` / `task logs:agent` for the
+systemd units.
 
 ## Documentation
 
 [`docs/architecture.md`](docs/architecture.md) covers the topology, the enrolment and
-login trust chain, what the TPM does and does not guarantee, a task-by-task walkthrough,
-troubleshooting, and how the lab maps onto a production deployment.
+login trust chain, what the TPM does and does not guarantee, the Vault Agent doing the
+same login unattended, what was learned by running Vault 2.2.0, a task-by-task
+walkthrough, troubleshooting, and how the lab maps onto a production deployment.
 
 ## Reset and cleanup
 
 ```bash
-task reset   # wipe lab state inside the VM, keep the VM
+task reset   # wipe lab state inside the VM (including both TPMs' seeds), keep the VM
 task clean   # delete and purge the VM entirely
 task rebuild # clean, then rebuild the whole lab from scratch
 ```
 
 All lab state — keys, certificates, Vault configuration — lives inside the VM. The host
-holds nothing but this source tree.
+holds nothing but this source tree and the gitignored `.env`, whose only secret is the
+licence.
