@@ -1,24 +1,26 @@
 ---
 version: '3'
 
+# Optional host overrides (see .env.template). Missing file is fine.
+dotenv: ['.env']
+
 vars:
-  # VM
-  NAME: tpm-lab
+  # VM. Every value here can be overridden by the same name in .env; see
+  # .env.template.
+  NAME: '{{.VM_NAME | default "tpm-lab"}}'
   UBUNTU: "24.04"
   CPUS: "2"
   MEMORY: 4G
   DISK: 20G
 
   # Lab identity
-  DEVICE_NAME: node01
-  DOMAIN: devices.lab.local
+  DEVICE_NAME: '{{.DEVICE_NAME | default "node01"}}'
+  DOMAIN: '{{.DOMAIN | default "devices.lab.local"}}'
 
-  # Software TPMs: the device TPM, and a second one standing in for a
-  # different machine during the Part 8.1 stolen-key demo.
-  TPM_PORT: "2321"
-  ATTACKER_TPM_PORT: "2331"
-
-  LAB_DIR: /home/ubuntu/lab
+  # Two software TPMs run in the VM: the device TPM, and a second one standing
+  # in for a different machine during the Part 8 demos. Each serves a unix
+  # socket inside its state directory; see scripts/lib/common.sh for the paths.
+  VM_DIR: /home/ubuntu/lab
 
   # Host-side scratch. Everything transient this project writes on the Mac goes
   # here, never /tmp — it is gitignored and removed by `task clean:tmp`.
@@ -30,6 +32,13 @@ vars:
   # lab's files cannot collide with anything else in the guest.
   VM_STAGE: /tmp/tpm-lab
 
+  # Vault Enterprise. The VM installs this vault-enterprise package version
+  # from the HashiCorp apt repository and holds it there. The licence is the
+  # one thing that comes from the host: its text, as VAULT_LICENSE in .env.
+  # It is deliberately not a Task var — Task echoes commands, so the licence
+  # must never pass through a template. Scripts read it from the environment.
+  VAULT_VERSION: '{{.VAULT_VERSION | default "2.2.0+ent-1"}}'
+
 tasks:
   default:
     cmd: task --list
@@ -38,7 +47,7 @@ tasks:
   # Host
   # ==========================================================================
   deps:
-    desc: Check host dependencies (multipass, task, jq, graphviz)
+    desc: Check host dependencies (multipass, task, jq, graphviz) and the Vault Enterprise licence
     cmd: ./scripts/host/deps.sh
 
   init:
@@ -108,10 +117,14 @@ tasks:
     desc: Follow the Vault dev server journal
     cmd: multipass exec {{.NAME}} -- sudo journalctl -u vault-dev -f
 
+  logs:agent:
+    desc: Follow the Vault Agent journal (Part 9)
+    cmd: multipass exec {{.NAME}} -- sudo journalctl -u vault-agent -f
+
   logs:
-    desc: Show recent logs from both lab services
+    desc: Show recent logs from all lab services
     cmds:
-      - multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -u swtpm@attacker -u vault-dev --no-pager -n 50
+      - multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -u swtpm@attacker -u vault-dev -u vault-agent --no-pager -n 50
 
   # ==========================================================================
   # Lab build — each step is idempotent and individually re-runnable
@@ -129,16 +142,22 @@ tasks:
       - echo "Lab ready. Run 'task demo' for the full walkthrough."
 
   provision:
-    desc: 'Part 1: install TPM tooling and Vault in the VM'
+    desc: 'Part 1: install TPM tooling and Vault Enterprise in the VM'
+    preconditions:
+      - sh: test -n "${VAULT_LICENSE:-}"
+        msg: "VAULT_LICENSE is empty — paste your Vault Enterprise licence text into .env (see .env.template)"
     cmds:
+      # The licence is pushed here, not in _sync: it changes rarely and lives
+      # outside the repo, so it must not ride along on every step.
+      - ./scripts/host/push_licence.sh {{.NAME}} {{.VM_STAGE}}
       - task: _run
-        vars: {SCRIPT: 00_provision.sh}
+        vars: {SCRIPT: 00_provision.sh, ARGS: '{{.VAULT_VERSION}}'}
 
   tpm:
     desc: 'Part 2: start the software TPMs as systemd units'
     cmds:
       - task: _run
-        vars: {SCRIPT: 10_tpm_unit.sh, ARGS: '{{.TPM_PORT}} {{.ATTACKER_TPM_PORT}}'}
+        vars: {SCRIPT: 10_tpm_unit.sh}
 
   vault:
     desc: 'Part 3: start the Vault dev server (TLS) as a systemd unit'
@@ -147,13 +166,13 @@ tasks:
         vars: {SCRIPT: 20_vault_unit.sh}
 
   config:
-    desc: 'Parts 4-5: configure PKI device CA, KV secret, policy and cert auth'
+    desc: 'Parts 4-5: tpm auth method and its CA, KV secret, policy, device group and role, orchestrator token'
     cmds:
       - task: _run
-        vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}}'}
+        vars: {SCRIPT: 30_vault_config.sh, ARGS: '{{.DOMAIN}} {{.DEVICE_NAME}}'}
 
   enrol:
-    desc: 'Part 6: create the device key inside the TPM and enrol it with Vault'
+    desc: 'Part 6: register the device TPM with Vault and attest it for a certificate'
     cmds:
       - task: _run
         vars: {SCRIPT: 40_enrol_device.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
@@ -162,12 +181,29 @@ tasks:
   # Demo
   # ==========================================================================
   demo:
-    desc: Run the full narrated demonstration (Parts 6-8)
+    desc: Run the full narrated demonstration (Parts 6-9), pausing between parts
     cmds:
       - task: demo:nonexportable
+      - task: _pause
+        vars:
+          NEXT: 'Part 7 — log in to Vault with the TPM-held key'
+          RESUME: demo:login
       - task: demo:login
+      - task: _pause
+        vars:
+          NEXT: 'Part 7.3 — least privilege: the read succeeds, the write is denied'
+          RESUME: demo:privilege
       - task: demo:privilege
+      - task: _pause
+        vars:
+          NEXT: 'Part 8 — the five negative tests'
+          RESUME: demo:negative
       - task: demo:negative
+      - task: _pause
+        vars:
+          NEXT: 'Part 9 — Vault Agent: the same login, unattended'
+          RESUME: demo:agent
+      - task: demo:agent
 
   demo:login:
     desc: 'Part 7: authenticate to Vault using the TPM-held key'
@@ -182,49 +218,71 @@ tasks:
         vars: {SCRIPT: 60_privilege.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:nonexportable:
-    desc: Show the key file on disk is a TPM-wrapped blob, not a private key
+    desc: Show the key files on disk are TPM-sealed handles, not private keys
     cmds:
       - task: _run
         vars: {SCRIPT: 45_nonexportable.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:negative:
-    desc: 'Part 8: every negative test, in order'
+    desc: 'Part 8: every negative test, in order, pausing between them'
     cmds:
       - task: demo:negative:stolen-key
-      - task: demo:negative:no-cert
+      - task: _pause
+        vars:
+          NEXT: '8.2 — an unregistered TPM is refused at attestation'
+          RESUME: demo:negative:unenrolled-tpm
+      - task: demo:negative:unenrolled-tpm
+      - task: _pause
+        vars:
+          NEXT: '8.3 — a genuinely attested certificate from another CA is rejected'
+          RESUME: demo:negative:untrusted-ca
       - task: demo:negative:untrusted-ca
-      - task: demo:negative:wrong-cn
+      - task: _pause
+        vars:
+          NEXT: '8.4 — a trusted-CA certificate bound to a different TPM and role is rejected'
+          RESUME: demo:negative:wrong-role
+      - task: demo:negative:wrong-role
+      - task: _pause
+        vars:
+          NEXT: '8.5 — a revoked token can no longer read'
+          RESUME: demo:negative:revoked-token
       - task: demo:negative:revoked-token
 
   demo:negative:stolen-key:
-    desc: '8.1: the key blob is useless against a different TPM'
+    desc: '8.1: the key blobs are useless against a different TPM'
     cmds:
       - task: _run
-        vars: {SCRIPT: 70_negative_stolen_key.sh, ARGS: '{{.DEVICE_NAME}} {{.ATTACKER_TPM_PORT}}'}
+        vars: {SCRIPT: 70_negative_stolen_key.sh, ARGS: '{{.DEVICE_NAME}}'}
 
-  demo:negative:no-cert:
-    desc: '8.2: login without a client certificate is rejected'
+  demo:negative:unenrolled-tpm:
+    desc: '8.2: a TPM Vault has not registered is refused at attestation'
     cmds:
       - task: _run
-        vars: {SCRIPT: 71_negative_no_cert.sh}
+        vars: {SCRIPT: 71_negative_unenrolled_tpm.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
 
   demo:negative:untrusted-ca:
-    desc: '8.3: a TPM key alone is not enough — the cert must chain to the device CA'
+    desc: '8.3: a genuinely attested cert from another CA is rejected'
     cmds:
       - task: _run
-        vars: {SCRIPT: 72_negative_untrusted_ca.sh, ARGS: '{{.DOMAIN}}'}
+        vars: {SCRIPT: 72_negative_untrusted_ca.sh, ARGS: '{{.DEVICE_NAME}} {{.DOMAIN}}'}
 
-  demo:negative:wrong-cn:
-    desc: '8.4: a trusted-CA cert with the wrong common name is rejected'
+  demo:negative:wrong-role:
+    desc: '8.4: a trusted-CA cert bound to a different TPM and role is rejected'
     cmds:
       - task: _run
-        vars: {SCRIPT: 73_negative_wrong_cn.sh}
+        vars: {SCRIPT: 73_negative_wrong_role.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   demo:negative:revoked-token:
     desc: '8.5: a revoked device token can no longer read'
     cmds:
       - task: _run
         vars: {SCRIPT: 74_negative_revoked_token.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  demo:agent:
+    desc: 'Part 9: Vault Agent attests and authenticates unattended'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 80_agent.sh, ARGS: '{{.DEVICE_NAME}}'}
 
   # ==========================================================================
   # Maintenance
@@ -235,6 +293,43 @@ tasks:
       - task: _run
         vars: {SCRIPT: 90_reset.sh}
       - echo "Lab state cleared. Rebuild with- task tpm vault config enrol"
+
+  agent:soak:
+    desc: 'Run the agent past its token''s max TTL and report whether it re-authenticates (~6m)'
+    cmds:
+      # Not part of 'task demo'. It lowers the devices role to 1m/3m tokens for
+      # the duration and restores them from a trap, so the agent reaches the
+      # re-authentication in minutes instead of the usual hour.
+      - task: _run
+        vars:
+          SCRIPT: 85_agent_soak.sh
+          # multipass exec does not carry the host's environment into the
+          # guest, so the length is an argument: task agent:soak SOAK_MINUTES=10
+          ARGS: '{{.DEVICE_NAME}} {{.SOAK_MINUTES | default "6"}}'
+
+  tpm:flush:
+    desc: Flush leaked TPM transient objects and sessions on both software TPMs
+    # silent: the command body is a dozen lines of shell and the useful output
+    # is the two slot counts it prints.
+    silent: true
+    cmds:
+      # A raw swtpm socket has no resource manager, so a client killed mid-call
+      # can leave a loaded key resident until something flushes it. swtpm has
+      # three slots. Vault 2.2.0 frees its own handles; this is for recovering
+      # from an interrupted run, and for checking the slot count.
+      - |
+        multipass exec {{.NAME}} -- sudo -u ubuntu bash -lc '
+          source ~/lab/env.sh
+          for sock in "${TPM_DEVICE_PATH}" "${ATTACKER_TPM_DEVICE_PATH}"; do
+            [ -S "${sock}" ] || continue
+            name=$(basename "$(dirname "${sock}")")
+            export TPM2TOOLS_TCTI="swtpm:path=${sock}"
+            tpm2_flushcontext -t >/dev/null 2>&1 || true
+            tpm2_flushcontext -l >/dev/null 2>&1 || true
+            avail=$(tpm2_getcap properties-variable 2>/dev/null \
+              | grep -i HR_TRANSIENT_AVAIL | tr -d " " | cut -d: -f2)
+            printf "  %-9s %s of 0x3 transient slots free\n" "${name}" "${avail:-?}"
+          done'
 
   lint:
     desc: Run pre-commit hooks (shellcheck, gitleaks) on all files
@@ -248,9 +343,9 @@ tasks:
           echo "graphviz not found. Install it with: brew install graphviz" >&2
           exit 1
         fi
-      - for: [topology, enrolment]
+      - for: [topology, enrolment, agent]
         cmd: dot -Tpng -Gdpi=144 -o docs/diagrams/{{.ITEM}}.png docs/diagrams/{{.ITEM}}.dot
-      - echo "Rendered docs/diagrams/topology.png and docs/diagrams/enrolment.png"
+      - echo "Rendered docs/diagrams/topology.png, enrolment.png and agent.png"
     sources:
       - docs/diagrams/*.dot
     generates:
@@ -269,6 +364,24 @@ tasks:
       - multipass exec {{.NAME}} -- mkdir -p {{.VM_STAGE}}
       - multipass transfer ./scripts/lib/common.sh {{.NAME}}:{{.VM_STAGE}}/common.sh
       - multipass transfer ./scripts/*.sh {{.NAME}}:{{.VM_STAGE}}/
+
+  # Pause between demo parts so the operator can narrate. Host-side on purpose:
+  # the prompt needs a terminal, and the Mac's is the only one reliably in the
+  # path — see the comment at the top of scripts/host/pause.sh.
+  #
+  # PAUSE=1 is the default for the demo; PAUSE=0 restores the uninterrupted
+  # run. Declaring it under env: means both `PAUSE=0 task demo` and
+  # `task demo PAUSE=0` work, and .env can set it for good.
+  _pause:
+    internal: true
+    interactive: true
+    run: always
+    requires:
+      vars: [NEXT]
+    env:
+      PAUSE: '{{.PAUSE | default "1"}}'
+    cmds:
+      - ./scripts/host/pause.sh '{{.NEXT}}' '{{.RESUME}}'
 
   _run:
     internal: true

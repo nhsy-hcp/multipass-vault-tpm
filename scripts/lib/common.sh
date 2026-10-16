@@ -1,20 +1,26 @@
 #!/bin/bash
-# Shared helpers for the TPM cert auth lab.
+# Shared helpers for the Vault TPM auth lab.
 # Sourced by every script in scripts/ (host and in-VM).
 # shellcheck shell=bash
 
 # Lab layout inside the VM. Overridable for testing.
-LAB_USER="${LAB_USER:-ubuntu}"
-LAB_DIR="${LAB_DIR:-/home/${LAB_USER}/lab}"
-LAB_STATE_DIR="${LAB_STATE_DIR:-${LAB_DIR}/state}"
-LAB_TLS_DIR="${LAB_TLS_DIR:-${LAB_DIR}/vault-tls}"
-LAB_PKI_DIR="${LAB_PKI_DIR:-${LAB_DIR}/pki}"
-export LAB_USER LAB_DIR LAB_STATE_DIR LAB_TLS_DIR LAB_PKI_DIR
+VM_USER="${VM_USER:-ubuntu}"
+VM_DIR="${VM_DIR:-/home/${VM_USER}/lab}"
+STATE_DIR="${STATE_DIR:-${VM_DIR}/state}"
+TLS_DIR="${TLS_DIR:-${VM_DIR}/vault-tls}"
+# Where `vault tpm attest` keeps each device's certificate and key blobs.
+TPM_DIR="${TPM_DIR:-${VM_DIR}/tpm}"
+export VM_USER VM_DIR STATE_DIR TLS_DIR TPM_DIR
 
-# Software TPM ports. The attacker TPM stands in for a different machine.
-TPM_PORT="${TPM_PORT:-2321}"
-ATTACKER_TPM_PORT="${ATTACKER_TPM_PORT:-2331}"
-export TPM_PORT ATTACKER_TPM_PORT
+# Software TPMs. Each swtpm instance serves a unix socket inside its own state
+# directory, and tpm2-tools, OpenSSL and the Vault CLI all reach the TPM through
+# that one path — on real hardware it becomes /dev/tpmrm0 and nothing else
+# changes. The attacker TPM stands in for a different machine: same software,
+# different storage seed.
+TPM_STATE_ROOT="${TPM_STATE_ROOT:-${VM_DIR}/tpmstate}"
+TPM_SOCK="${TPM_SOCK:-${TPM_STATE_ROOT}/device/swtpm.sock}"
+ATTACKER_TPM_SOCK="${ATTACKER_TPM_SOCK:-${TPM_STATE_ROOT}/attacker/swtpm.sock}"
+export TPM_STATE_ROOT TPM_SOCK ATTACKER_TPM_SOCK
 
 # Scratch space.
 #
@@ -24,8 +30,8 @@ export TPM_PORT ATTACKER_TPM_PORT
 # where the Taskfile drops the scripts and is the only place they should write
 # scratch files — namespaced so the lab cannot collide with anything else.
 VM_STAGE="${VM_STAGE:-/tmp/tpm-lab}"
-LAB_TMP="${LAB_TMP:-${VM_STAGE}/scratch}"
-export VM_STAGE LAB_TMP
+SCRATCH_DIR="${SCRATCH_DIR:-${VM_STAGE}/scratch}"
+export VM_STAGE SCRATCH_DIR
 
 # Point mktemp and anything else honouring TMPDIR at the lab's own scratch dir,
 # so nothing this project runs leaves files loose in the system temp directory.
@@ -36,12 +42,12 @@ export VM_STAGE LAB_TMP
 # fails with "Permission denied". Root can still write to a 0700 directory it
 # does not own. Guarded so host-side scripts, where the lab user does not
 # exist, are unaffected.
-mkdir -p "${LAB_TMP}" 2>/dev/null || true
-if [[ ${EUID} -eq 0 ]] && id -u "${LAB_USER}" >/dev/null 2>&1; then
-  chown "${LAB_USER}:${LAB_USER}" "${LAB_TMP}" 2>/dev/null || true
-  chmod 0700 "${LAB_TMP}" 2>/dev/null || true
+mkdir -p "${SCRATCH_DIR}" 2>/dev/null || true
+if [[ ${EUID} -eq 0 ]] && id -u "${VM_USER}" >/dev/null 2>&1; then
+  chown "${VM_USER}:${VM_USER}" "${SCRATCH_DIR}" 2>/dev/null || true
+  chmod 0700 "${SCRATCH_DIR}" 2>/dev/null || true
 fi
-TMPDIR="${LAB_TMP}"
+TMPDIR="${SCRATCH_DIR}"
 export TMPDIR
 
 # --- output -----------------------------------------------------------------
@@ -154,7 +160,7 @@ wait_for_unit() {
 as_lab_user() {
   local cmd
   cmd="$(printf '%q ' "$@")"
-  runuser -u "${LAB_USER}" -- bash -lc "set -euo pipefail; source '${LAB_DIR}/env.sh'; ${cmd}"
+  runuser -u "${VM_USER}" -- bash -lc "set -euo pipefail; source '${VM_DIR}/env.sh'; ${cmd}"
 }
 
 # Same, but tolerates failure and returns the exit status to the caller.
@@ -165,8 +171,167 @@ as_lab_user_allow_fail() {
   return "${rc}"
 }
 
+# --- showing the commands ----------------------------------------------------
+# The lab is a demonstration, so the Vault commands that do the work belong on
+# screen. These print the command an operator would type and then run it, from
+# the same argv — unlike a hand-written echo beside the call, which drifts.
+#
+# Narration goes to fd 9, a duplicate of the script's stderr taken here, once.
+# Not stdout: several callers capture a vault command's stdout with $( ) and
+# parse it as JSON. Not plain stderr either: the report_expect callers capture
+# with $( ... 2>&1 ) to quote what Vault said, and a banner inside that capture
+# would be reported as the "actual" outcome. Fd 9 escapes both.
+exec 9>&2
+
+# Render argv as a copy-pasteable command line: quote only what needs quoting,
+# and redact bearer tokens so a pasted transcript stays clean and gitleaks has
+# nothing to find. The dev server's root token is literally 'root' and is not a
+# secret, so it is left alone.
+fmt_cmd() {
+  local out='' arg literal
+  for arg in "$@"; do
+    literal=0
+    case "${arg}" in
+      # The device's placeholder is the opposite of a secret: it is the proof
+      # that no real token was on the wire. Show it.
+      "VAULT_TOKEN=${NO_TOKEN}") ;;
+      # A caller that already labelled its own token, e.g. VAULT_TOKEN=<device>.
+      VAULT_TOKEN=\<*\>)   literal=1 ;;
+      VAULT_TOKEN=*)       arg='VAULT_TOKEN=<redacted>'; literal=1 ;;
+      hvs.*|hvb.*|hvr.*)   arg='<token>';                literal=1 ;;
+    esac
+    if (( literal == 0 )) && [[ ! "${arg}" =~ ^[A-Za-z0-9_@%+=:,./-]+$ ]]; then
+      # Single quotes, not printf %q: an operator is meant to read this and
+      # paste it, and %q renders a sentence as a thicket of backslashes.
+      arg="'${arg//\'/\'\\\'\'}'"
+    fi
+    out+="${arg} "
+  done
+  printf '%s' "${out% }"
+}
+
+show_cmd() { printf '%s  $ %s%s\n' "${_C_BOLD}" "$(fmt_cmd "$@")" "${_C_RESET}" >&9; }
+
+# show_cmd + as_lab_user, in the two flavours the lab already uses.
+vault_run()            { show_cmd "$@"; as_lab_user "$@"; }
+vault_run_allow_fail() { show_cmd "$@"; as_lab_user_allow_fail "$@"; }
+
+# For the policy writes, which read their body on stdin
+# (`vault policy write <name> -`): show the command and the body, then run it.
+vault_run_stdin() {
+  local body line
+  body="$(cat)"
+  show_cmd "$@"
+  while IFS= read -r line; do
+    printf '    %s%s%s\n' "${_C_DIM}" "${line}" "${_C_RESET}" >&9
+  done <<< "${body}"
+  printf '%s\n' "${body}" | as_lab_user "$@"
+}
+
 lab_mkdir() {
-  install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0755 "$@"
+  install -d -o "${VM_USER}" -g "${VM_USER}" -m 0755 "$@"
+}
+
+# Write stdin to a lab-owned file. Vault CLI output is captured by root, so
+# ownership is applied on the way to disk rather than inherited.
+write_lab_file() {
+  local dest="$1" mode="${2:-0644}" tmp
+  tmp="$(mktemp)"
+  cat > "${tmp}"
+  install -o "${VM_USER}" -g "${VM_USER}" -m "${mode}" "${tmp}" "${dest}"
+  rm -f "${tmp}"
+}
+
+# --- TPM housekeeping -------------------------------------------------------
+# flush_tpm_contexts [socket]
+#
+# The software TPM is reached over a raw socket. There is no kernel resource
+# manager (/dev/tpmrm0) in the path to free transient objects when a client
+# disconnects. Vault 2.2.0 frees its own handles, but a client killed mid-call
+# (an interrupted demo, a stopped agent) can still leave a key loaded, and
+# swtpm has only three transient slots — a fourth load fails with "out of
+# memory for object contexts". Flushing before every TPM-touching Vault command
+# is cheap insurance. On real hardware the resource manager does this itself.
+flush_tpm_contexts() {
+  local sock="${1:-${TPM_SOCK}}"
+  as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
+    tpm2_flushcontext -t >/dev/null 2>&1 || true
+  as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
+    tpm2_flushcontext -l >/dev/null 2>&1 || true
+}
+
+# free_transient_slots [socket]
+#
+# How many of the TPM's transient object slots are free, exactly as the TPM
+# reports it — "0x3" on swtpm means all three. A probe, not a demonstration:
+# it loads nothing, flushes nothing, and stays on plain as_lab_user.
+free_transient_slots() {
+  local sock="${1:-${TPM_SOCK}}" avail
+  avail="$(as_lab_user_allow_fail env "TPM2TOOLS_TCTI=swtpm:path=${sock}" \
+    tpm2_getcap properties-variable 2>/dev/null \
+    | grep -i HR_TRANSIENT_AVAIL | tr -d ' ' | cut -d: -f2)" || true
+  printf '%s' "${avail:-unknown}"
+}
+
+# --- the device side of Vault ------------------------------------------------
+# The attestation and login endpoints are unauthenticated, so Vault ignores
+# whatever token the CLI attaches — but leaving VAULT_TOKEN alone would put
+# 'root' on the wire during the very steps that are meant to prove the device
+# holds no credential, and an empty value is worse: the CLI falls back to the
+# ~/.vault-token helper file, which the dev server populates with the root
+# token. A deliberate placeholder keeps the demo honest.
+NO_TOKEN="device-holds-no-token"
+export NO_TOKEN
+
+# tpm_attest <socket> <state-dir> <role> <cn> [mount]
+#
+# Runs `vault tpm attest` as the lab user with no token, flushing transient
+# contexts first. Vault rate-limits attestation to one per EK every ten
+# seconds, so a rate-limit refusal is retried after a wait; any other
+# outcome is returned as-is. Prints the CLI's output; returns its exit status.
+tpm_attest() {
+  local sock="$1" state_dir="$2" role="$3" cn="$4" mount="${5:-tpm}"
+  local attempt=0 rc out
+  # Shown once, not per attempt: a rate-limit retry runs the same command.
+  show_cmd env "VAULT_TOKEN=${NO_TOKEN}" \
+    vault tpm attest \
+      -role-name="${role}" \
+      -mount-path="auth/${mount}" \
+      -tpm-device-path="${sock}" \
+      -tpm-state-dir="${state_dir}" \
+      -cert-subject-CN="${cn}"
+  while :; do
+    attempt=$(( attempt + 1 ))
+    flush_tpm_contexts "${sock}"
+    rc=0
+    out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${NO_TOKEN}" \
+      vault tpm attest \
+        -role-name="${role}" \
+        -mount-path="auth/${mount}" \
+        -tpm-device-path="${sock}" \
+        -tpm-state-dir="${state_dir}" \
+        -cert-subject-CN="${cn}" 2>&1)" || rc=$?
+    if (( rc != 0 )) && printf '%s' "${out}" | grep -qi 'rate limit'; then
+      if (( attempt < 4 )); then
+        log_detected "Vault's per-EK attestation rate limit" "waiting 12s before retrying (attempt ${attempt})" >&2
+        sleep 12
+        continue
+      fi
+      # Out of retries and still rate-limited. The caller is about to report
+      # this refusal under whatever label it expected to prove, so say plainly
+      # that the rate limit, not the thing under test, is what refused.
+      log_warn "still rate-limited after ${attempt} attempts — this refusal is the rate limit, not the outcome under test"
+    fi
+    printf '%s\n' "${out}"
+    return "${rc}"
+  done
+}
+
+# True when the named mount is already present at the given path ("tpm/").
+mount_enabled() {
+  local kind="$1" path="$2"
+  as_lab_user vault "${kind}" list -format=json 2>/dev/null \
+    | jq -e --arg p "${path}" 'has($p)' >/dev/null 2>&1
 }
 
 # --- misc -------------------------------------------------------------------
