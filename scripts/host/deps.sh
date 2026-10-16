@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Host scratch lives in the project, per the project convention. Create it here
 # so anything running later can rely on it existing.
-export LAB_TMP="${PROJECT_ROOT}/.tmp"
+export SCRATCH_DIR="${PROJECT_ROOT}/.tmp"
 # shellcheck source=../lib/common.sh
 source "${SCRIPT_DIR}/../lib/common.sh"
 
@@ -43,8 +43,18 @@ fi
 log_step "Multipass"
 multipass version | sed 's/^/  /'
 
+# Vault Enterprise itself is installed from apt inside the VM; only the
+# licence text comes from the host, as VAULT_LICENSE in .env. Never printed.
+# Report rather than fail: `task provision` is the hard gate.
+log_step "Vault Enterprise licence"
+if [[ -n "${VAULT_LICENSE:-}" ]]; then
+  log_ok "VAULT_LICENSE set (${#VAULT_LICENSE} characters)"
+else
+  log_warn "VAULT_LICENSE is empty — paste your licence text into .env before 'task provision'"
+fi
+
 log_info ''
-log_detail "Apple Silicon hosts create arm64 guests; the HashiCorp apt repo and"
-log_detail "Ubuntu TPM packages both publish arm64 builds, so no changes are needed."
+log_detail "Apple Silicon hosts create arm64 guests, Intel hosts amd64; the HashiCorp and"
+log_detail "Ubuntu repositories publish both, so no changes are needed."
 
 log_ok "host is ready — next: task all"

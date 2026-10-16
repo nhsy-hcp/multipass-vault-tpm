@@ -10,7 +10,7 @@ source "${STAGE_DIR}/common.sh"
 # expect-vs-actual so the operator judges the outcome rather than trusting a
 # green tick:
 #
-#   1. token lookup  -> display_name cert-tpm-devices, TTL around 15m
+#   1. token lookup  -> display_name tpm-tpm-devices, TTL around 15m
 #   2. kv get        -> succeeds
 #   3. kv put        -> permission denied  (the failure IS the pass condition)
 #
@@ -28,7 +28,7 @@ source "${STAGE_DIR}/common.sh"
 device="${1:-}"
 [[ -n "${device}" ]] || die "usage: 60_privilege.sh <device-name>"
 
-LOGIN_JSON="${LAB_STATE_DIR}/login.json"
+LOGIN_JSON="${STATE_DIR}/login.json"
 SECRET_PATH="secret/devices/${device}"
 
 require_cmd jq runuser || die "missing prerequisites"
@@ -47,6 +47,9 @@ log_detail "using the device token from ${LOGIN_JSON} (${token:0:12}...), not th
 # "actual" half of the pair; failure is never fatal here.
 vault_as_device() {
   local rc=0 out
+  # Shown before the capture below, and labelled rather than redacted: which
+  # identity is on the wire is what this part is about.
+  show_cmd env 'VAULT_TOKEN=<device>' "$@"
   out="$(as_lab_user_allow_fail env "VAULT_TOKEN=${token}" "$@" 2>&1)" || rc=$?
   printf '%s' "${out}"
   return "${rc}"
@@ -58,7 +61,6 @@ first_line() { printf '%s\n' "$1" | grep -m1 -v '^[[:space:]]*$' || printf '(no 
 # --- 1. who is this token? ---------------------------------------------------
 log_info ""
 log_info "1. Look the token up — who does Vault think we are?"
-log_detail "   VAULT_TOKEN=<device> vault token lookup"
 
 rc=0
 lookup="$(vault_as_device vault token lookup -format=json)" || rc=$?
@@ -66,20 +68,21 @@ if (( rc == 0 )); then
   display_name="$(printf '%s' "${lookup}" | jq -r '.data.display_name // "(none)"')"
   ttl="$(printf '%s' "${lookup}" | jq -r '.data.ttl // 0')"
   policies="$(printf '%s' "${lookup}" | jq -r '(.data.policies // []) | join(", ")')"
+  tpm_id="$(printf '%s' "${lookup}" | jq -r '.data.meta.tpm_id // "(none)"')"
   [[ "${ttl}" =~ ^[0-9]+$ ]] || ttl=0
-  report_expect "display_name cert-tpm-devices, ttl ~15m" \
+  report_expect "display_name tpm-tpm-devices, ttl ~15m" \
                 "display_name ${display_name}, ttl ${ttl}s (~$(( ttl / 60 ))m)"
   log_detail "   policies: ${policies}"
-  [[ "${display_name}" == "cert-tpm-devices" ]] || log_warn "display_name is not cert-tpm-devices — was the cert role renamed?"
+  log_detail "   tpm_id:   ${tpm_id} — the token is bound to the TPM that authenticated"
+  [[ "${display_name}" == "tpm-tpm-devices" ]] || log_warn "display_name is not tpm-tpm-devices — was the tpm auth role renamed?"
 else
-  report_expect "display_name cert-tpm-devices, ttl ~15m" "lookup failed: $(first_line "${lookup}")"
+  report_expect "display_name tpm-tpm-devices, ttl ~15m" "lookup failed: $(first_line "${lookup}")"
   log_warn "the token is not usable — it may already have expired (15m TTL)"
 fi
 
 # --- 2. the read it is entitled to -------------------------------------------
 log_info ""
 log_info "2. Read the device secret — inside the policy."
-log_detail "   VAULT_TOKEN=<device> vault kv get ${SECRET_PATH}"
 
 rc=0
 read_out="$(vault_as_device vault kv get -format=json "${SECRET_PATH}")" || rc=$?
@@ -94,7 +97,6 @@ fi
 # --- 3. the write it is not ---------------------------------------------------
 log_info ""
 log_info "3. Write to the same path — outside the policy. This should be refused."
-log_detail "   VAULT_TOKEN=<device> vault kv put ${SECRET_PATH} message=tampered"
 
 rc=0
 write_out="$(vault_as_device vault kv put "${SECRET_PATH}" message=tampered)" || rc=$?
