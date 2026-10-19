@@ -134,7 +134,7 @@ digraph agent {
   certmgr -> authh [label="  5. the certificate it keeps"];
 
   authh -> vault [
-    label="6. auth/tpm/login over mTLS,\nthe handshake signed inside the TPM",
+    label="  6. auth/tpm/login over mTLS,\l  the handshake signed inside the TPM\l",
     color="#7d5b92",
     fontcolor="#5a3f6b"
   ];
@@ -148,8 +148,8 @@ digraph agent {
     fontcolor="#5a3f6b"
   ];
 
-  certmgr -> certmgr [
-    label="  10. renewal timer — re-attest\n  before the certificate expires",
+  certmgr:w -> certmgr:w [
+    label="10. renewal timer —\nre-attest before the\ncertificate expires  ",
     style=dotted,
     color="#5f8a57",
     fontcolor="#3f5f39"
