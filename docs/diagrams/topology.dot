@@ -137,7 +137,7 @@ digraph topology {
     # empty right-hand cell shifts the text off the line.
     label=<<TABLE BORDER="0" CELLBORDER="0" CELLPADDING="0" CELLSPACING="0"><TR>
              <TD ALIGN="RIGHT">Part 8.1: same blobs,<BR/>different TPM &#8594;<BR/>integrity check fails<BR/>Part 8.2: unregistered EK &#8594;<BR/>refused at attestation</TD>
-             <TD WIDTH="24"></TD></TR></TABLE>>,
+             <TD WIDTH="140"></TD></TR></TABLE>>,
     style=dashed,
     color="#6b6b64",
     fontcolor="#3d3d38",
