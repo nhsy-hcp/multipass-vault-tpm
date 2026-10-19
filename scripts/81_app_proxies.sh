@@ -2,7 +2,7 @@
 # Workflow 3: one Vault Agent API proxy per application, each on a Unix socket
 # that only that application's user can open.
 #
-# Vault 2.2.0-rc1+ent: method "tpm" is registered on `vault agent`, not
+# Vault 2.2.0+ent: method "tpm" is registered on `vault agent`, not
 # `vault proxy`. Each unit runs agent with tpm_cert + auto_auth method tpm,
 # fixed to one role, and forces that token on the unix listener.
 set -euo pipefail

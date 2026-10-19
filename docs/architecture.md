@@ -199,7 +199,7 @@ trusting the same device certificate. The payments token cannot read the analyti
 secret. The payments process can, by logging in again and naming `analytics-app`.
 The role is a field in the login body. `task demo:shared-host` is that run.
 
-The primary workflows use native `auth/tpm`. On Vault Enterprise `2.2.0-rc1+ent`,
+The primary workflows use native `auth/tpm`. On Vault Enterprise `2.2.0+ent`,
 `method "tpm"` is registered on `vault agent` (not the `vault proxy` subcommand).
 Workflow 2 isolates token handling behind a localhost HTTP proxy. Workflow 3 additionally
 fixes one role per agent and restricts each Unix socket to its workload UID. The software

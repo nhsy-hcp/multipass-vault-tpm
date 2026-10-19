@@ -8,7 +8,7 @@ Unix socket whose agent logs in as that same role.
 
 Everything runs on a macOS host driving an Ubuntu 24.04 VM via Multipass.
 
-Vault TPM authentication requires Vault Enterprise `2.2.0-rc1+ent`. Put the Enterprise
+Vault TPM authentication requires Vault Enterprise `2.2.0+ent`. Put the Enterprise
 licence at `.vault-license` before `task provision-demo`.
 
 | Tool | Why |

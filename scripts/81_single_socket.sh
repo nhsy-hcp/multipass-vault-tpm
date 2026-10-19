@@ -6,7 +6,7 @@
 # The agent process stays root so the TPM state directory stays unreadable
 # by the workload. Only the socket is theirs.
 #
-# Vault 2.2.0-rc1+ent registers method "tpm" on `vault agent`, not
+# Vault 2.2.0+ent registers method "tpm" on `vault agent`, not
 # `vault proxy`.
 set -euo pipefail
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -91,7 +91,7 @@ fi
 # releases.hashicorp.com and install the binary at /usr/local/bin/vault so it
 # wins over any leftover /usr/bin/vault from an earlier apt install.
 
-VAULT_VERSION="${VAULT_VERSION:-2.2.0-rc1+ent}"
+VAULT_VERSION="${VAULT_VERSION:-2.2.0+ent}"
 VAULT_INSTALL_DIR="/usr/local/bin"
 VAULT_BIN="${VAULT_INSTALL_DIR}/vault"
 
@@ -115,7 +115,7 @@ vault_sums_url="${vault_base_url}/vault_${VAULT_VERSION}_SHA256SUMS"
 need_vault_install=1
 if [[ -x "${VAULT_BIN}" ]]; then
   installed="$(${VAULT_BIN} version 2>/dev/null || true)"
-  # vault version prints "Vault v2.2.0-rc1+ent (...)" — match the version token.
+  # vault version prints "Vault v2.2.0+ent (...)" — match the version token.
   if printf '%s' "${installed}" | grep -Fq "v${VAULT_VERSION}"; then
     need_vault_install=0
     log_detected "Vault ${VAULT_VERSION} already at ${VAULT_BIN}" "skipping download"

@@ -5,7 +5,7 @@
 # VM, so the authoritative content is the heredoc in scripts/81_app_proxies.sh.
 # Keep the two in sync.
 #
-# ExecStart uses `vault agent` because 2.2.0-rc1+ent registers method "tpm"
+# ExecStart uses `vault agent` because 2.2.0+ent registers method "tpm"
 # there, not under `vault proxy`.
 
 [Unit]

@@ -4,7 +4,7 @@
 # VM, so the authoritative content is the heredoc in scripts/81_app_proxies.sh.
 # Keep the two in sync.
 #
-# Vault 2.2.0-rc1+ent puts TPM auto-auth on `vault agent`, not `vault proxy`
+# Vault 2.2.0+ent puts TPM auto-auth on `vault agent`, not `vault proxy`
 # (`unknown auto-auth method type tpm` from the proxy subcommand). The agent
 # still exposes the unix listener and forces its auto-auth token.
 
