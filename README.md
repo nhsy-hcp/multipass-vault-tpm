@@ -51,7 +51,7 @@ in `.env`), holding it there so an `apt upgrade` cannot move it.
 task deps    # verify host tooling and that VAULT_LICENSE is set in .env
 task init    # one-time project setup (pre-commit hooks, .env)
 task all     # launch the VM, provision it, start the TPMs and Vault, enrol node01
-task demo    # the narrated walkthrough, every negative test, and the Vault Agent
+task demo    # the narrated walkthrough, every negative test, the Vault Agent and its proxies
 ```
 
 `task all` takes a few minutes on first run; each of its steps is idempotent and
@@ -70,14 +70,27 @@ task --list
 ```
 
 That is the authoritative catalogue — build steps, individual demo segments,
-`task shell`, and `task logs:tpm` / `task logs:vault` / `task logs:agent` for the
-systemd units.
+`task shell`, and `task logs:tpm` / `task logs:vault` / `task logs:agent` /
+`task logs:proxy` for the systemd units.
+
+## Beyond the login: agents for workloads
+
+The last three parts of `task demo` take the operator out of the loop:
+
+| Part | Task | What it shows |
+|---|---|---|
+| 9 | `task demo:agent` | Vault Agent attests, logs in and renders a secret with no operator and no starting token |
+| 10 | `task demo:proxy` | A workload talks to `http://127.0.0.1:8100` and never holds a token — the agent forces its own TPM-authenticated one onto every request |
+| 11 | `task demo:multi-app` | Two applications on one TPM, each with its own agent, role and owner-only Unix socket — and the checks that neither can reach the other's secret, socket or the TPM |
+
+The TPM proves which machine is asking, not which application; Part 11 shows where the
+boundary between applications has to come from instead.
 
 ## Documentation
 
 [`docs/architecture.md`](docs/architecture.md) covers the topology, the enrolment and
 login trust chain, what the TPM does and does not guarantee, the Vault Agent doing the
-same login unattended, what was learned by running Vault 2.2.0, a task-by-task
+same login unattended and as a per-application proxy, what was learned by running Vault 2.2.0, a task-by-task
 walkthrough, troubleshooting, and how the lab maps onto a production deployment.
 
 ## Reset and cleanup

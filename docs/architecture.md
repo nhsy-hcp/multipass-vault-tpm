@@ -31,7 +31,12 @@ The lab demonstrates the whole chain end to end:
   least-privilege token;
 - negative tests proving that stolen key blobs, an unregistered TPM, a certificate from a
   different CA, a certificate bound to a different TPM and role, and a revoked token all
-  fail.
+  fail;
+- Vault Agent doing the device's work unattended, then standing in front of workloads as
+  an API proxy — one on localhost HTTP, and one per application behind an owner-only
+  Unix socket.
+
+![TPM authentication with Vault](diagrams/tpm-auth-overview.png)
 
 The TPM is a software TPM (`swtpm`) rather than silicon, because macOS does not expose a
 TPM to Multipass guests. Everything above the device path is identical to real hardware.
@@ -549,6 +554,76 @@ Everything here was established by running the agent from Vault Enterprise 2.2.0
 A sibling feature ships beside this one in the same release — `pki_external_ca`, which
 orders certificates from an external ACME CA with a TPM-held key. It is not used here.
 
+## Vault Agent API proxies (Parts 10-11)
+
+Part 9's agent writes its token to a sink, which a workload must still read and present.
+Parts 10 and 11 remove that step: the agent's `api_proxy` forwards ordinary Vault
+requests and **forces** its own token onto each one (`use_auto_auth_token = "force"`),
+replacing whatever the caller sent — no token, a stale one, or root.
+
+The `tpm_cert` and `auto_auth` halves are exactly Part 9's. What changes is the listener,
+and who may reach it.
+
+![One application, one TPM-backed Vault identity](diagrams/single-app-walkthrough.png)
+
+### Part 10: one workload on localhost
+
+`vault-proxy-single` runs as the lab user, attests into `~/lab/tpm/proxy/` as role
+`payments-app`, and listens on `http://127.0.0.1:8100`. The workload sets `VAULT_ADDR`
+to that URL and reads `secret/payments/app` holding only the `device-holds-no-token`
+placeholder. Sending the dev root token through the proxy for `secret/analytics/app` is
+still denied: the agent replaced it with its `payments-read` token.
+
+This is **token automation, not isolation**. Any process on the host that can reach a
+loopback TCP port gets `payments-app`'s privileges.
+
+### Part 11: one agent per application
+
+The TPM cannot tell applications apart. `payments-app` and `analytics-app` both trust the
+`devices` group, because it is one machine with one EK; anything that can drive this TPM
+can attest for either role. So the boundary between applications comes from the OS:
+
+| Layer | Payments | Analytics |
+|---|---|---|
+| Unix user | `payments` (system, `nologin`) | `analytics` |
+| Agent | `vault-proxy@payments`, role `payments-app` fixed in `/etc/vault-proxy/payments.hcl` | `vault-proxy@analytics`, role `analytics-app` |
+| Listener | `/run/vault-proxy/payments.sock`, `payments:payments 0600` | `/run/vault-proxy/analytics.sock`, `analytics:analytics 0600` |
+| Policy | `payments-read` — `secret/data/payments/*` | `analytics-read` — `secret/data/analytics/*` |
+| Attest directory | `~/lab/tpm/app-payments/`, root 0700 | `~/lab/tpm/app-analytics/`, root 0700 |
+
+![Per-application proxies sharing one TPM](diagrams/proxy-boundary.png)
+
+The agents run as **root**, a deliberate exception to "lab artefacts belong to the lab
+user", for two reasons. Only root can hand a listening socket to another uid
+(`socket_user`). And an agent running as the application's own user would give that user
+the TPM and its key blobs — and with them a login as any role the group is trusted for.
+As root, neither application can open the TPM socket or read the agents' state, which is
+the sixth of Part 11's checks:
+
+| # | As | Request | Result |
+|---|---|---|---|
+| 1 | `payments` | own socket, own secret | `payments settlement batch` |
+| 2 | `payments` | own socket, analytics secret | `permission denied` (policy) |
+| 3 | `payments` | as 2, with `VAULT_TOKEN=root` | `permission denied` — the agent forced its token |
+| 4 | `analytics` | payments socket | `dial unix …: connect: permission denied` (socket mode) |
+| 5 | `analytics` | own socket, own secret | `analytics risk model` |
+| 6 | each | the TPM socket; its agent's attest directory | both refused |
+
+Both parts keep Part 9's conventions: units installed **disabled** and started by their
+script, attest directories of their own (one level under `~/lab/tpm/`, so `task config`
+clears their certificates with everyone else's when a fresh mount brings a new CA), and an
+`EXIT` trap that stops them and flushes the TPM. Each waits 12 seconds before starting an
+agent: an agent attests the moment it starts, and an agent refused by the per-EK rate
+limit schedules its own retry about 45 seconds out.
+
+### Observations from the proxies
+
+| Expectation | Reality |
+|---|---|
+| `vault proxy` is the daemon for an API proxy | In 2.2.0 it has no `tpm` auto-auth method — `unknown auto-auth method type tpm`. `vault agent` with an `api_proxy` stanza gives the same listener |
+| `use_auto_auth_token = "force"` is needed to ignore a caller's token | It is: with `true` the agent only fills in a missing token, and a caller's root token would pass straight through |
+| Two agents can share one swtpm | They can. Started one at a time, both stayed up and served every Part 11 request, across re-runs and after `task reset`. Concurrent first starts were not tried: the lab avoids them rather than relying on three transient slots being enough |
+
 ## Lab layout inside the VM
 
 All lab state lives inside the VM, owned by the `ubuntu` user, under `~/lab`:
@@ -561,9 +636,11 @@ All lab state lives inside the VM, owned by the `ubuntu` user, under `~/lab`:
 | `~/lab/tpmstate/<instance>/` | Software TPM state and its socket, one directory per swtpm instance. The storage seed lives here — this is what makes the key handles machine-bound |
 | `~/lab/vault-tls/` | The dev server's own TLS material: `vault-ca.pem`, `vault-cert.pem`, `vault-key.pem` |
 | `~/lab/agent/` | The Part 9 agent's own files: `agent.hcl`, the template source, and — only while it runs — the token sink and the rendered secret |
-| `~/lab/tpm/<device>/` | What `vault tpm attest` wrote: `client.crt`, `ca_chain.pem`, `app.blob`, `ak.blob`, `client-key.json`, plus `ek.pub` and `tpm_id` from step 6.1. The Part 8 tests keep their own directories beside it (`stolen`, `unenrolled`, `rogue`, `attacker`), one per test so none of them inherits another's certificate |
+| `~/lab/proxy/` | The Part 10 proxy's `proxy.hcl` |
+| `/etc/vault-proxy/<app>.hcl`, `/run/vault-proxy/<app>.sock` | Part 11: each application's agent config (root 0600) and its listener (`<app>:<app>` 0600, only while the agent runs) |
+| `~/lab/tpm/<device>/` | What `vault tpm attest` wrote: `client.crt`, `ca_chain.pem`, `app.blob`, `ak.blob`, `client-key.json`, plus `ek.pub` and `tpm_id` from step 6.1. The Part 8 tests keep their own directories beside it (`stolen`, `unenrolled`, `rogue`, `attacker`), one per test so none of them inherits another's certificate, as do the agents: `agent` (Part 9), `proxy` (Part 10), and the root-owned `app-payments` and `app-analytics` (Part 11) |
 
-Four systemd units run the daemons, three of them enabled:
+Seven systemd units run the daemons, three of them enabled:
 
 | Unit | Role |
 |---|---|
@@ -571,6 +648,8 @@ Four systemd units run the daemons, three of them enabled:
 | `swtpm@attacker` | A second, independently seeded TPM on `~/lab/tpmstate/attacker/swtpm.sock`, used only by the Part 8 tests |
 | `vault-dev` | `/usr/bin/vault server -dev -dev-tls` on https://127.0.0.1:8200, licensed from `EnvironmentFile=/etc/vault-dev.env` |
 | `vault-agent` | The Part 9 agent. **Installed disabled** and started only by `task demo:agent`, which stops it again on the way out — see Vault Agent above |
+| `vault-proxy-single` | The Part 10 proxy on `127.0.0.1:8100`, as the lab user. Disabled; started and stopped by `task demo:proxy` |
+| `vault-proxy@payments`, `vault-proxy@analytics` | The Part 11 per-application agents, as root. Disabled; started and stopped by `task demo:multi-app` |
 
 Running them as units rather than `nohup` plus PID files is deliberate:
 readiness becomes `systemctl is-active` instead of a blind `sleep`, restarts are ordinary
@@ -596,14 +675,16 @@ stolen-key test never requires stopping and restarting the real one.
 | `task demo:privilege` | Read then write with the device token | Read succeeds, write is denied |
 | `task demo:negative` | All five negative tests in order | Each prints its expected and actual outcome for the operator to judge |
 | `task demo:agent` | Part 9: writes the agent config and unit, starts it, and stops it again | A token matching Part 7's and a rendered secret, both produced with no operator. The unit stays disabled |
-| `task demo` | The complete narrated run | Pauses between parts; a couple of minutes with `PAUSE=0` |
+| `task demo:proxy` | Part 10: the localhost proxy, a tokenless read through it, and a root token it ignores | `payments settlement batch`, then `permission denied`. The unit stays disabled |
+| `task demo:multi-app` | Part 11: users, configs and agents per application, then the six boundary checks | Each application reads only its own secret, through only its own socket. Both units stay disabled |
+| `task demo` | The complete narrated run | Pauses between parts; a few minutes with `PAUSE=0` |
 | `task shell` | Interactive shell in the VM | `source ~/lab/env.sh` to work by hand |
-| `task logs`, `task logs:tpm`, `task logs:vault`, `task logs:agent` | Journals for the lab units | |
+| `task logs`, `task logs:tpm`, `task logs:vault`, `task logs:agent`, `task logs:proxy` | Journals for the lab units | |
 | `task tpm:flush` | Flushes transient objects and sessions on both TPMs and prints the free slots | Recovery after an interrupted run: a client killed mid-call can leave a key loaded, and swtpm has three slots. The scripts flush for themselves |
 | `task reset` | Clears lab state and both TPMs' seeds, keeps the VM, the Vault package and the licence | Rebuild with `task tpm vault config enrol` |
 | `task clean` / `task rebuild` | Destroy the VM / destroy and rebuild | |
 | `task lint` | pre-commit: shellcheck, gitleaks | Must pass before committing |
-| `task docs:diagram` | Re-renders all three PNGs from the `.dot` sources | Needs graphviz on the host |
+| `task docs:diagram` | Re-renders the PNGs from the `.dot` and `.svg` sources | Needs graphviz and librsvg on the host |
 
 ### Pacing the demo
 
@@ -636,7 +717,8 @@ Pauses sit between the demo tasks, not inside them. Running one part on its own
 | `swtpm@device` fails with `Could not open lockfile: Permission denied` | AppArmor, not file ownership. Ubuntu's `usr.bin.swtpm` profile allows state only under `owner @{HOME}/**` and `owner /var/lib/swtpm/**` | The lab keeps state in `~/lab/tpmstate`, which the profile already permits. If you move `TPM_STATE_ROOT` elsewhere, expect this. Confirm with `sudo dmesg \| grep -i apparmor` |
 | `Failed to connect to …/swtpm.sock.ctrl` from tpm2-tools | The swtpm TCTI needs the control socket beside the data socket | Both are created by the unit; check `ls ~/lab/tpmstate/device/` and restart `swtpm@device` |
 | `out of memory for object contexts` from a login or attest | A transient handle left loaded by an interrupted client — there is no resource manager over a raw socket | `task tpm:flush` (the scripts flush before each call anyway); see the observations above. The same message in `task logs:agent` at agent start-up is expected and harmless — see the agent observations |
-| `rate limit exceeded for this EK` | A second attestation within ~10s of the last | Wait and retry; `task enrol` and the Part 8 scripts already do |
+| `rate limit exceeded for this EK` | A second attestation within ~10s of the last | Wait and retry; `task enrol` and the Part 8 scripts already do. In `task logs:proxy` it is followed by the agent's own retry ~45s later |
+| An application's request through its socket hangs or is refused at `dial unix` | The agent is not running (the units are disabled and stopped on the way out), or the caller is not the socket's owner | `sudo systemctl start vault-proxy@<app>`; run the client as `<app>` |
 | `no TPM found for EK public key` at attestation | The EK is not in `identity/tpm` | Run `task enrol` (or, after a Vault restart, `task config && task enrol`) |
 | `permission denied` (403) at `gentpmcert/begin` | The EK is registered but the role does not trust it — not in the group, or the role names another group | `vault read auth/tpm/role/devices`; `vault read identity/tpmgroup/name/devices` |
 | `authentication failed` at login | The certificate was issued by another mount's CA, or names a TPM the role does not trust | Compare the certificate's SAN (`openssl x509 -ext subjectAltName`) with the role and group |

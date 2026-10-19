@@ -31,6 +31,9 @@ TPM_ROLE="devices"
 ORCH_POLICY="enrol-orchestrator"
 ORCH_TOKEN_FILE="${STATE_DIR}/orchestrator.token"
 
+# The workloads Parts 10 and 11 run on the device, each with its own role.
+APPS=(payments analytics)
+
 log_step "Parts 4-5: tpm auth method, demo secret, policy, device group and role"
 
 require_cmd jq install || die "missing tooling — run 'task provision' first"
@@ -186,6 +189,36 @@ log_detail "TTL:      $(printf '%s' "${orch_json}" | jq -r '.auth.lease_duration
 log_detail "It can register an EK and admit it to '${TPM_GROUP}'. It cannot change the"
 log_detail "'${TPM_ROLE}' role, read a secret, or mint a token."
 
+# --- Part 5.6: two applications on the same host -----------------------------
+# Parts 10 and 11 put two workloads on the enrolled device. Each gets a secret,
+# a policy that reads only that secret, and a role of its own. Both roles trust
+# the same 'devices' group, on purpose: it is one machine with one TPM, so
+# the TPM proves which host is asking, never which application. Part 11 draws
+# the application boundary in the OS instead — a Vault Agent per app, fixed to
+# one role, on a socket only that app's user can open.
+log_step "Part 5.6: application secrets, policies and roles (payments, analytics)"
+
+vault_run vault kv put secret/payments/app message="payments settlement batch"
+vault_run vault kv put secret/analytics/app message="analytics risk model"
+
+for app in "${APPS[@]}"; do
+  vault_run_stdin vault policy write "${app}-read" - <<EOF
+path "secret/data/${app}/*" {
+  capabilities = ["read"]
+}
+EOF
+  # Same trust anchor as the 'devices' role: the group, never tpm_ids. 15m/1h with
+  # no period, like 'devices', so an agent re-authenticates with the TPM at
+  # every token_max_ttl rather than renewing one token for ever.
+  vault_run vault write "auth/${TPM_MOUNT}/role/${app}-app" \
+    tpmgroup_ids="${group_id}" \
+    display_name="tpm-${app}-app" \
+    token_policies="${app}-read" \
+    token_ttl=15m \
+    token_max_ttl=1h
+done
+log_ok "roles $(printf '%s-app ' "${APPS[@]}")trust the '${TPM_GROUP}' group"
+
 # --- sentinel ---------------------------------------------------------------
 # Later scripts gate on this file: it records that Parts 4-5 completed against a
 # particular domain, mount and group, and survives nothing that Vault itself
@@ -199,6 +232,7 @@ jq -n \
   --arg role "${TPM_ROLE}" \
   --arg orch_policy "${ORCH_POLICY}" \
   --arg orch_token_file "${ORCH_TOKEN_FILE}" \
+  --arg apps "${APPS[*]}" \
   --arg configured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   '{
      status: "complete",
@@ -210,6 +244,7 @@ jq -n \
      tpm_role: ("auth/" + $mount + "/role/" + $role),
      orchestrator_policy: $orch_policy,
      orchestrator_token_file: $orch_token_file,
+     app_roles: ($apps | split(" ") | map("auth/" + $mount + "/role/" + . + "-app")),
      configured_at: $configured_at
    }' | write_lab_file "${SENTINEL}"
 

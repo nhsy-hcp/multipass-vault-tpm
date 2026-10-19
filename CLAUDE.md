@@ -63,7 +63,7 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 
 | Task | Purpose |
 |---|---|
-| `demo` | The full narrated run (Parts 6–9), pausing between parts — `PAUSE=0 task demo` runs it straight through |
+| `demo` | The full narrated run (Parts 6–11), pausing between parts — `PAUSE=0 task demo` runs it straight through |
 | `demo:nonexportable` | The key files are TPM-sealed handles, not private keys |
 | `demo:login` | Part 7: mTLS login with the TPM-held key |
 | `demo:privilege` | Part 7.3: read succeeds, write denied |
@@ -74,17 +74,19 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 | `demo:negative:wrong-role` | 8.4: a trusted-CA cert bound to a different TPM and role is rejected |
 | `demo:negative:revoked-token` | 8.5: a revoked token can no longer read |
 | `demo:agent` | Part 9: Vault Agent attests, logs in and renders a secret unattended |
+| `demo:proxy` | Part 10: a workload reads through a localhost agent API proxy (`127.0.0.1:8100`) holding no token; a caller's root token is ignored |
+| `demo:multi-app` | Part 11: per-application agents (`payments`, `analytics`) on owner-only unix sockets, and six boundary checks |
 
 **Maintenance**
 
 | Task | Purpose |
 |---|---|
 | `reset` | Wipe lab state and TPM seeds inside the VM, keep the VM, Vault package and licence |
-| `logs` / `logs:tpm` / `logs:vault` / `logs:agent` | Journals for `swtpm@device`, `swtpm@attacker`, `vault-dev`, `vault-agent` |
+| `logs` / `logs:tpm` / `logs:vault` / `logs:agent` / `logs:proxy` | Journals for `swtpm@device`, `swtpm@attacker`, `vault-dev`, `vault-agent`, `vault-proxy-single` and `vault-proxy@*` |
 | `agent:soak` | Run the agent past its token's max TTL (role temporarily at 1m/3m, restored from a trap) and report whether it re-authenticates and how many TPM slots are free — ~6m, not part of `task demo` |
 | `tpm:flush` | Flush transient objects and sessions on both TPMs, and report the free slots — recovery after an interrupted run left a key loaded |
 | `lint` | pre-commit: shellcheck, gitleaks |
-| `docs:diagram` | Re-render `docs/diagrams/*.dot` to PNG (needs graphviz) |
+| `docs:diagram` | Re-render `docs/diagrams/*.dot` and `*.svg` to PNG (needs graphviz and librsvg) |
 
 ## Conventions
 
@@ -233,6 +235,22 @@ Run `task --list` for the authoritative version. Grouped by purpose:
   map is accepted silently). An empty `tpm_cert {}` block segfaults the agent, and
   unknown keys anywhere in it are dropped in silence. See `docs/architecture.md` →
   Vault Agent.
+- **The Parts 10–11 proxies keep the Part 9 conventions, plus two of their own.** Both
+  run `vault agent` with an `api_proxy` stanza — **not** `vault proxy`, which in 2.2.0 has
+  no `tpm` auto-auth method — and must keep `use_auto_auth_token = "force"`, which is what
+  makes a caller's root token irrelevant. Units disabled, started by their script, own
+  attest directories, stopped and flushed from an `EXIT` trap, a 12s wait before each
+  agent start (a rate-limited agent retries ~45s later). Part 11's agents run as **root**,
+  deliberately: only root can set `socket_user` to another uid, and an agent running as
+  the application's user would hand that user the TPM — and a login as any role the
+  `devices` group is trusted for. Their attest directories are `~/lab/tpm/app-<app>/`,
+  root 0700, one level down so `task config`'s stale-certificate sweep and `task reset`
+  cover them. `payments-app` and `analytics-app` trust the `devices` **group**, like
+  `devices` — the TPM identifies the host, never the application; the OS draws that
+  boundary. Do not "fix" that with `tpm_ids` or per-app groups.
+- **`.env` beats the command line for `VM_NAME`.** The Taskfile's `dotenv` values win over
+  `task VM_NAME=…`, so a second VM needs `VM_NAME` changed in `.env` (or removed from it),
+  not a CLI override — otherwise the run quietly targets `tpm-lab`.
 - **`.plans/` and `.tmp/` are gitignored.** The migration plan at
   `.plans/tpm-auth-method-migration.md` records the design and the empirical findings,
   but it is not committed — do not link to it from `README.md` or `docs/`.

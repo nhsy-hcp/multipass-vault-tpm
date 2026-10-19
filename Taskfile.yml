@@ -121,10 +121,14 @@ tasks:
     desc: Follow the Vault Agent journal (Part 9)
     cmd: multipass exec {{.NAME}} -- sudo journalctl -u vault-agent -f
 
+  logs:proxy:
+    desc: Follow the Vault Agent proxy journals (Parts 10-11)
+    cmd: multipass exec {{.NAME}} -- sudo journalctl -u vault-proxy-single -u 'vault-proxy@*' -f
+
   logs:
     desc: Show recent logs from all lab services
     cmds:
-      - multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -u swtpm@attacker -u vault-dev -u vault-agent --no-pager -n 50
+      - multipass exec {{.NAME}} -- sudo journalctl -u swtpm@device -u swtpm@attacker -u vault-dev -u vault-agent -u vault-proxy-single -u 'vault-proxy@*' --no-pager -n 50
 
   # ==========================================================================
   # Lab build — each step is idempotent and individually re-runnable
@@ -181,7 +185,7 @@ tasks:
   # Demo
   # ==========================================================================
   demo:
-    desc: Run the full narrated demonstration (Parts 6-9), pausing between parts
+    desc: Run the full narrated demonstration (Parts 6-11), pausing between parts
     cmds:
       - task: demo:nonexportable
       - task: _pause
@@ -204,6 +208,16 @@ tasks:
           NEXT: 'Part 9 — Vault Agent: the same login, unattended'
           RESUME: demo:agent
       - task: demo:agent
+      - task: _pause
+        vars:
+          NEXT: 'Part 10 — a localhost Vault proxy: the workload holds no token'
+          RESUME: demo:proxy
+      - task: demo:proxy
+      - task: _pause
+        vars:
+          NEXT: 'Part 11 — one agent per application, on owner-only sockets'
+          RESUME: demo:multi-app
+      - task: demo:multi-app
 
   demo:login:
     desc: 'Part 7: authenticate to Vault using the TPM-held key'
@@ -284,6 +298,18 @@ tasks:
       - task: _run
         vars: {SCRIPT: 80_agent.sh, ARGS: '{{.DEVICE_NAME}}'}
 
+  demo:proxy:
+    desc: 'Part 10: a workload reads through a localhost Vault Agent proxy, holding no token'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 81_proxy.sh, ARGS: '{{.DEVICE_NAME}}'}
+
+  demo:multi-app:
+    desc: 'Part 11: per-application agents on owner-only sockets, and the boundary between them'
+    cmds:
+      - task: _run
+        vars: {SCRIPT: 82_app_proxies.sh, ARGS: '{{.DEVICE_NAME}}'}
+
   # ==========================================================================
   # Maintenance
   # ==========================================================================
@@ -336,7 +362,7 @@ tasks:
     cmd: pre-commit run --all-files
 
   docs:diagram:
-    desc: Render the architecture diagrams from Graphviz sources to PNG
+    desc: Render the architecture diagrams (Graphviz .dot and hand-drawn .svg) to PNG
     cmds:
       - |
         if ! command -v dot >/dev/null 2>&1; then
@@ -345,9 +371,17 @@ tasks:
         fi
       - for: [topology, enrolment, agent]
         cmd: dot -Tpng -Gdpi=144 -o docs/diagrams/{{.ITEM}}.png docs/diagrams/{{.ITEM}}.dot
-      - echo "Rendered docs/diagrams/topology.png, enrolment.png and agent.png"
+      - |
+        if ! command -v rsvg-convert >/dev/null 2>&1; then
+          echo "rsvg-convert not found. Install it with: brew install librsvg" >&2
+          exit 1
+        fi
+      - for: [tpm-auth-overview, single-app-walkthrough, proxy-boundary]
+        cmd: rsvg-convert --zoom 1.5 -o docs/diagrams/{{.ITEM}}.png docs/diagrams/{{.ITEM}}.svg
+      - echo "Rendered docs/diagrams/topology, enrolment, agent, tpm-auth-overview, single-app-walkthrough and proxy-boundary .png"
     sources:
       - docs/diagrams/*.dot
+      - docs/diagrams/*.svg
     generates:
       - docs/diagrams/*.png
 

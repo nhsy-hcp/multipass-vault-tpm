@@ -27,7 +27,7 @@
 <rect x="1160" y="160" width="320" height="760" rx="24" fill="#fff" stroke="#D5DCE6" stroke-width="1.5" filter="url(#sh)" />
 <path d="M1160 184a24 24 0 0 1 24-24h272a24 24 0 0 1 24 24v51H1160z" fill="#1E293B"/>
 <text x="1320" y="198" font-size="21" font-weight="700" fill="#fff" text-anchor="middle">Vault · auth/tpm</text>
-<text x="1320" y="222" font-size="14" font-weight="400" fill="#CBD5E1" text-anchor="middle">cert auth, TPM-anchored</text>
+<text x="1320" y="222" font-size="14" font-weight="400" fill="#CBD5E1" text-anchor="middle">role trusts the devices group</text>
 <text x="1320" y="520" font-size="14" font-weight="400" fill="#475569" text-anchor="middle">Role is fixed in the agent config.</text>
 <text x="1320" y="544" font-size="14" font-weight="400" fill="#475569" text-anchor="middle">Vault maps role → policy; the</text>
 <text x="1320" y="568" font-size="14" font-weight="400" fill="#475569" text-anchor="middle">caller never picks either.</text>
