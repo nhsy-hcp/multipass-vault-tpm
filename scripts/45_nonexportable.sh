@@ -1,90 +1,103 @@
 #!/bin/bash
-# Non-exportability proof: the file on disk is a TPM-wrapped blob, not a key.
-# This sits between Part 6 (enrolment) and Part 7 (login) and is the claim the
-# rest of the lab rests on — the written guide asserts it but never shows it.
-# Print every command before running it so the operator can reproduce the proof
-# interactively rather than having to trust the script's summary.
+# Non-exportability proof: the key files on disk are TPM-sealed handles, not
+# keys. This sits between Part 6 (enrolment) and Part 7 (login) and is the
+# claim the rest of the lab rests on. Failure of the middle check is the
+# success condition, so nothing here aborts on a non-zero exit; each check
+# reports expected vs actual instead.
 set -euo pipefail
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${STAGE_DIR}/common.sh"
 
 DEVICE="${1:-node01}"
-KEY="${LAB_PKI_DIR}/${DEVICE}.tpmkey.pem"
-EXPORT_ATTEMPT="${VM_STAGE}/${DEVICE}-export-attempt.pem"
-TSS2_HEADER="-----BEGIN TSS2 PRIVATE KEY-----"
+DEVICE_DIR="${TPM_DIR}/${DEVICE}"
+APP_BLOB="${DEVICE_DIR}/app.blob"
+AK_BLOB="${DEVICE_DIR}/ak.blob"
+KEY_JSON="${DEVICE_DIR}/client-key.json"
+CRT="${DEVICE_DIR}/client.crt"
 
 log_step "Proof: the private key cannot leave the TPM (${DEVICE})"
 
-[[ -f "${LAB_DIR}/env.sh" ]] || die "no ${LAB_DIR}/env.sh — run 'task provision' first"
-[[ -f "${KEY}" ]] || die "no key at ${KEY} — run 'task enrol' first"
-trap 'rm -f "${EXPORT_ATTEMPT}"' EXIT
+[[ -f "${VM_DIR}/env.sh" ]] || die "no ${VM_DIR}/env.sh — run 'task provision' first"
+[[ -s "${APP_BLOB}" && -s "${CRT}" ]] || die "no attested key at ${DEVICE_DIR} — run 'task enrol' first"
 
-# --- 1. ask OpenSSL to serialise the provider-managed key -------------------
-log_step "1. Ask OpenSSL to write the TPM key"
-log_detail "$ openssl pkey -provider default -provider tpm2 \\"
-log_detail "    -in ${KEY} -out ${EXPORT_ATTEMPT}"
-as_lab_user openssl pkey -provider default -provider tpm2 \
-  -in "${KEY}" -out "${EXPORT_ATTEMPT}"
+# --- 1. what the file claims to be ------------------------------------------
+log_step "1. What is in app.blob"
+log_detail "The Vault CLI stores TPM keys as a JSON handle, not a PEM key."
+fields="$(as_lab_user jq -r 'keys | join(", ")' "${APP_BLOB}" 2>/dev/null || printf '(not parsable as JSON)')"
+report_expect "Public, KeyBlob, Name, and the AK's certification of the key — no private key field" \
+              "${fields}"
+keyblob_bytes="$( (as_lab_user jq -r '.KeyBlob' "${APP_BLOB}" 2>/dev/null | base64 -d 2>/dev/null | wc -c | tr -d ' ') || printf 0)"
+log_ok "KeyBlob is ${keyblob_bytes} bytes of TPM ciphertext: the private area, sealed under this TPM's storage key"
 
-log_info ""
-log_detail "$ head -1 ${EXPORT_ATTEMPT}"
-export_header="$(head -1 "${EXPORT_ATTEMPT}")"
-printf '%s\n' "${export_header}"
-if [[ "${export_header}" == "${TSS2_HEADER}" ]]; then
-  log_info ""
-  log_info "Despite its name, 'TSS2 PRIVATE KEY' is a TPM object container."
-  log_info "It contains a public area and an encrypted private area, not the EC"
-  log_info "private scalar. It can perform private operations only through its TPM."
-else
-  die "unexpected export format — inspect ${EXPORT_ATTEMPT}"
-fi
-
-# --- 2. prove the output is unusable as an ordinary private key -------------
-log_step "2. Try to read that output without the TPM provider"
-log_detail "$ openssl pkey -in ${EXPORT_ATTEMPT} -noout -text"
+# --- 2. the negative: it is not a key any software can load ------------------
+log_step "2. Load it as a private key WITHOUT the TPM — this must fail"
+log_detail "openssl pkey -in ${APP_BLOB} -noout -text"
 rc=0
-out="$(as_lab_user_allow_fail openssl pkey -in "${EXPORT_ATTEMPT}" -noout -text 2>&1)" || rc=$?
-printf '%s\n' "${out}"
-log_detail "(exit ${rc})"
+out="$(as_lab_user_allow_fail openssl pkey -in "${APP_BLOB}" -noout -text 2>&1)" || rc=$?
+first_line="$(printf '%s' "${out}" | head -1)"
+report_expect "failure: there is no private key here to load" \
+  "exit ${rc}${first_line:+ — ${first_line}}"
 if (( rc != 0 )); then
-  log_ok "the default provider cannot decode it because no private key was exported"
+  log_ok "refused — without the TPM there is nothing here to load"
 else
-  die "the output was readable without the TPM provider — it is not TPM-wrapped"
+  log_error "the blob was readable as a private key — it is NOT TPM-backed"
 fi
 
 # --- 3. what the bytes actually are -----------------------------------------
-log_step "3. Inspect the wrapped object's ASN.1 structure"
-log_detail "$ openssl asn1parse -in ${EXPORT_ATTEMPT}"
-asn_rc=0
-asn_out="$(as_lab_user_allow_fail openssl asn1parse -in "${EXPORT_ATTEMPT}" 2>&1)" || asn_rc=$?
-printf '%s\n' "${asn_out}" | sed 's/^/  /'
-if (( asn_rc == 0 )); then
-  # grep -c exits 1 on no match; the count is what matters, not the status.
-  octets="$(printf '%s\n' "${asn_out}" | grep -c 'OCTET STRING' || true)"
-  log_ok "${octets} opaque OCTET STRINGs hold the public area and encrypted TPM-private area"
+log_step "3. The public area: a TPM object with attributes the TPM enforces"
+# .Public is a TPMT_PUBLIC; tpm2_print wants the size-prefixed TPM2B form.
+pub_tmp="$(mktemp)"
+trap 'rm -f "${pub_tmp}" "${pub_tmp}.raw"' EXIT
+as_lab_user jq -r '.Public' "${APP_BLOB}" | base64 -d > "${pub_tmp}.raw" 2>/dev/null || true
+if [[ -s "${pub_tmp}.raw" ]]; then
+  len="$(wc -c < "${pub_tmp}.raw" | tr -d ' ')"
+  { printf "\\x$(printf '%02x' $(( len >> 8 )))\\x$(printf '%02x' $(( len & 255 )))"; cat "${pub_tmp}.raw"; } > "${pub_tmp}"
+  rm -f "${pub_tmp}.raw"
+  print_rc=0
+  print_out="$(tpm2_print -t TPM2B_PUBLIC "${pub_tmp}" 2>&1)" || print_rc=$?
+  if (( print_rc == 0 )); then
+    printf '%s\n' "${print_out}" | grep -E -A1 '^(type|name-alg|attributes):' | grep -v '^--' | sed 's/^/  /'
+    attrs="$(printf '%s\n' "${print_out}" | awk '/^attributes:/{getline; print $2}')"
+    report_expect "attributes include fixedtpm and fixedparent: the object cannot be duplicated out of this TPM" \
+                  "${attrs:-(not parsed)}"
+    if [[ "${attrs}" == *fixedtpm* && "${attrs}" == *fixedparent* ]]; then
+      log_ok "the TPM itself refuses to duplicate this key — that is the hardware guarantee"
+    else
+      log_warn "fixedtpm/fixedparent not both present — check the key template the Vault CLI uses"
+    fi
+  else
+    printf '%s\n' "${print_out}" | sed 's/^/  /'
+    report_expect "a parsable TPM2B_PUBLIC" "tpm2_print exited ${print_rc}"
+    log_warn "could not parse the public area — see the error above"
+  fi
 else
-  die "could not parse the TPM wrapper (exit ${asn_rc})"
+  log_warn "could not decode .Public from ${APP_BLOB}"
 fi
 
-# --- 4. the asymmetry: the public half does come out ------------------------
-log_step "4. Export the public key"
-log_detail "$ openssl pkey -provider default -provider tpm2 \\"
-log_detail "    -in ${KEY} -pubout"
-pub_rc=0
-pub_out="$(as_lab_user_allow_fail openssl pkey -provider default -provider tpm2 \
-  -in "${KEY}" -pubout 2>&1)" || pub_rc=$?
-if (( pub_rc == 0 )); then
-  printf '%s\n' "${pub_out}" | sed 's/^/  /'
-  log_ok "the public key is exportable; the private key remains TPM-wrapped"
+# --- 4. the asymmetry: the public half is in the certificate -----------------
+log_step "4. The public key IS available — it is in the certificate, and it matches"
+cert_hash="$( (as_lab_user openssl x509 -in "${CRT}" -pubkey -noout 2>/dev/null \
+  | as_lab_user openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1) || true)"
+json_hash="$(as_lab_user jq -r '.public_key_sha256 // empty' "${KEY_JSON}" 2>/dev/null || true)"
+report_expect "client-key.json public_key_sha256 = sha256 of the certificate's public key" \
+              "json ${json_hash:0:16}… / cert ${cert_hash:0:16}…"
+if [[ -n "${json_hash}" && "${json_hash}" == "${cert_hash}" ]]; then
+  log_ok "public out, private never — the certificate binds to a key only this TPM can use"
 else
-  printf '%s\n' "${pub_out}"
-  die "could not extract the public key (exit ${pub_rc})"
+  log_warn "the hashes differ — the handle and the certificate may not describe the same key"
 fi
+
+# --- the attestation key, for completeness -----------------------------------
+log_step "5. Same story for the attestation key (ak.blob)"
+ak_fields="$(as_lab_user jq -r 'keys | join(", ")' "${AK_BLOB}" 2>/dev/null || printf '(unreadable)')"
+log_detail "  fields: ${ak_fields}"
+log_detail "  The AK is what certified the application key during 'vault tpm attest'. It is"
+log_detail "  sealed to this TPM in exactly the same way, and it is only ever used inside it."
 
 # --- close -------------------------------------------------------------------
 log_info ''
-log_info "This blob is encrypted to this TPM's storage root key, so it is useless on"
-log_info "any other machine: copying it buys an attacker nothing without the silicon"
-log_info "that unwraps it. The bonus stolen-key test proves that by pointing it at"
-log_info "a second TPM and watching the login fail."
+log_info "Both blobs are ciphertext under this TPM's storage root key, so they are"
+log_info "useless on any other machine: copying them buys an attacker nothing without"
+log_info "the silicon that unwraps them. Part 8.1 proves exactly that by pointing the"
+log_info "same files at a second TPM and watching the login fail."

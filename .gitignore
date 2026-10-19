@@ -18,6 +18,7 @@
 *.key
 *.serial
 *.tpmkey
+*.hclic
 
 # logs
 logs/
@@ -31,4 +32,3 @@ logs/
 # os
 .DS_Store
 Thumbs.db
-.vault-license

@@ -6,83 +6,46 @@ source "${STAGE_DIR}/common.sh"
 
 # Part 2: run the software TPMs as supervised systemd units.
 #
-# The guide starts a single swtpm with nohup. Two changes here:
-#   1. systemd instead of nohup, so the TPM survives a reboot and its output
-#      lands in the journal rather than a stray log file.
-#   2. two instances, `device` and `attacker`. The Part 8.1 stolen-key demo
-#      needs a second TPM with a different storage seed; running both at once
-#      on separate ports means the demo just re-points the TCTI instead of
-#      killing and restarting the only TPM in the lab.
+# Two instances, `device` and `attacker`. The Part 8 demos need a second TPM
+# with a different storage seed; running both permanently means a demo just
+# points at a different socket instead of killing and restarting the only TPM
+# in the lab.
+#
+# Each TPM is served on a unix socket inside its own state directory. That one
+# path is shared by everything that talks to the TPM — tpm2-tools through the
+# swtpm TCTI, and the Vault CLI through -tpm-device-path — which is exactly the
+# shape of a real machine, where the path is /dev/tpmrm0 instead.
 
 log_step "Part 2: start the software TPMs (swtpm@device, swtpm@attacker)"
 
-DEVICE_PORT="${1:-${TPM_PORT}}"
-ATTACKER_PORT="${2:-${ATTACKER_TPM_PORT}}"
-
-# TPM state lives under the lab user's home, not /var/lib.
-#
-# Ubuntu ships an enforcing AppArmor profile for swtpm (/etc/apparmor.d/
-# usr.bin.swtpm) that permits state only under `owner @{HOME}/**` and
-# `owner /var/lib/swtpm/**`. A path like /var/lib/swtpm-lab is denied when swtpm
-# creates its .lock file, and the daemon exits with a misleading
-# "Could not open lockfile: Permission denied" despite the directory being owned
-# by the right user.
-#
-# Keeping state under $LAB_DIR satisfies the existing policy, so the lab needs
-# no `aa-complain` and AppArmor stays in enforce mode. It also means `task reset`
-# clears TPM state along with the rest of the lab tree.
-STATE_ROOT="${LAB_DIR}/tpmstate"
-ENV_DIR="/etc/swtpm-lab"
+STATE_ROOT="${TPM_STATE_ROOT}"
 UNIT_PATH="/etc/systemd/system/swtpm@.service"
 
 INSTANCES=(device attacker)
-declare -A INSTANCE_PORT=(
-  [device]="${DEVICE_PORT}"
-  [attacker]="${ATTACKER_PORT}"
+declare -A INSTANCE_SOCK=(
+  [device]="${TPM_SOCK}"
+  [attacker]="${ATTACKER_TPM_SOCK}"
 )
 
 require_cmd swtpm swtpm_setup systemctl || die "run 'task provision' first"
 # as_lab_user sources this file, so every later verification depends on it.
-[[ -f "${LAB_DIR}/env.sh" ]] || die "${LAB_DIR}/env.sh is missing — run 'task provision' first"
-
-for inst in "${INSTANCES[@]}"; do
-  port="${INSTANCE_PORT[${inst}]}"
-  [[ "${port}" =~ ^[0-9]+$ ]] || die "invalid port '${port}' for instance '${inst}'"
-done
+[[ -f "${VM_DIR}/env.sh" ]] || die "${VM_DIR}/env.sh is missing — run 'task provision' first"
 
 # --- state directories -------------------------------------------------------
 
 # 0700 and owned by the lab user: swtpm runs as that user, and the state file
 # holds the storage seed that makes a TPM-wrapped key blob non-portable. Not
 # lab_mkdir, which is deliberately 0755.
-install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0755 "${STATE_ROOT}"
+#
+# Ubuntu ships an enforcing AppArmor profile for swtpm (/etc/apparmor.d/
+# usr.bin.swtpm) that permits state only under `owner @{HOME}/**` and
+# `owner /var/lib/swtpm/**`. Keeping state (and the sockets) under $VM_DIR
+# satisfies that policy, so AppArmor stays in enforce mode.
+install -d -o "${VM_USER}" -g "${VM_USER}" -m 0755 "${STATE_ROOT}"
 for inst in "${INSTANCES[@]}"; do
-  install -d -o "${LAB_USER}" -g "${LAB_USER}" -m 0700 "${STATE_ROOT}/${inst}"
+  install -d -o "${VM_USER}" -g "${VM_USER}" -m 0700 "${STATE_ROOT}/${inst}"
 done
-log_ok "state directories under ${STATE_ROOT} (0700, ${LAB_USER})"
-
-# --- per-instance port files -------------------------------------------------
-
-# A templated unit cannot vary its ports by itself, so each instance gets an
-# EnvironmentFile that systemd resolves from %i. The control channel sits one
-# port above the command channel, matching the guide's 2321/2322 pairing.
-install -d -m 0755 "${ENV_DIR}"
-declare -A NEEDS_RESTART=()
-for inst in "${INSTANCES[@]}"; do
-  port="${INSTANCE_PORT[${inst}]}"
-  ctrl_port=$(( port + 1 ))
-  if write_if_changed "${ENV_DIR}/${inst}.env" <<EOF
-# Ports for swtpm@${inst}. Written by scripts/10_tpm_unit.sh.
-SWTPM_PORT=${port}
-SWTPM_CTRL_PORT=${ctrl_port}
-EOF
-  then
-    log_info "Wrote ${ENV_DIR}/${inst}.env (server ${port}, ctrl ${ctrl_port})"
-    NEEDS_RESTART[${inst}]=1
-  else
-    log_detected "unchanged ${ENV_DIR}/${inst}.env" "instance '${inst}' keeps port ${port}"
-  fi
-done
+log_ok "state directories under ${STATE_ROOT} (0700, ${VM_USER})"
 
 # --- the templated unit ------------------------------------------------------
 
@@ -91,22 +54,22 @@ done
 # on the host and are never transferred into the VM, so the unit has to be
 # written inline here.
 #
-# \${SWTPM_PORT} / \${SWTPM_CTRL_PORT} are escaped so systemd expands them from
-# the EnvironmentFile; %i is systemd's instance-name specifier.
+# %i is systemd's instance-name specifier. The .ctrl socket is swtpm's control
+# channel, used only by the swtpm TCTI. A stale socket left by an unclean stop
+# would block the bind, hence the ExecStartPre.
 unit_changed=0
 if write_if_changed "${UNIT_PATH}" <<EOF
 # Software TPM 2.0 (%i). Generated by scripts/10_tpm_unit.sh.
 [Unit]
 Description=Software TPM 2.0 (%i)
 Documentation=man:swtpm(8)
-After=network.target
 
 [Service]
 Type=simple
-User=${LAB_USER}
-Group=${LAB_USER}
-EnvironmentFile=${ENV_DIR}/%i.env
-ExecStart=/usr/bin/swtpm socket --tpm2 --tpmstate dir=${STATE_ROOT}/%i --server type=tcp,port=\${SWTPM_PORT} --ctrl type=tcp,port=\${SWTPM_CTRL_PORT} --flags not-need-init,startup-clear
+User=${VM_USER}
+Group=${VM_USER}
+ExecStartPre=/bin/rm -f ${STATE_ROOT}/%i/swtpm.sock ${STATE_ROOT}/%i/swtpm.sock.ctrl
+ExecStart=/usr/bin/swtpm socket --tpm2 --tpmstate dir=${STATE_ROOT}/%i --server type=unixio,path=${STATE_ROOT}/%i/swtpm.sock --ctrl type=unixio,path=${STATE_ROOT}/%i/swtpm.sock.ctrl --flags not-need-init,startup-clear
 Restart=on-failure
 RestartSec=1
 
@@ -122,26 +85,30 @@ fi
 
 # --- one-time TPM manufacturing ---------------------------------------------
 
-# Does a fresh state directory need swtpm_setup before the socket will start?
+# `--flags not-need-init,startup-clear` is about the runtime handshake: swtpm
+# does not wait for an INIT on the control channel and issues
+# TPM2_Startup(CLEAR) itself. On an empty state directory libtpms builds blank
+# default state, so the socket would start without swtpm_setup — but the
+# endorsement key would then be created lazily and without the EK certificate
+# a manufactured TPM carries. swtpm_setup makes the lab TPM look like a real
+# one, and it is the EK that Vault's identity/tpm registry is keyed on.
 #
-# Reasoning: `--flags not-need-init,startup-clear` is about the *runtime*
-# handshake — it tells swtpm not to wait for an INIT on the control channel and
-# to issue TPM2_Startup(CLEAR) itself. It says nothing about manufacturing. On
-# an empty state directory libtpms builds default blank state and swtpm
-# persists it, so the socket does start and tpm2_getrandom / key creation work.
-# What is missing without swtpm_setup is the endorsement key and the EK and
-# platform certificates in NVRAM — needed for attestation-based enrolment, not
-# for this lab, which only creates and uses an ordinary TPM-resident key.
-#
-# So swtpm_setup is very likely unnecessary. It is run anyway because it is the
-# safe superset: it costs one command on first provision, it makes the lab TPM
-# look like a real manufactured one, and it leaves the door open for the Part
-# 9.3 / EK-attestation stretch goals. It is best-effort — a failure here is
-# logged and the socket is started regardless, since the socket does not depend
-# on it. UNCERTAINTY: confirm on the first real run that swtpm_setup succeeds
-# on 24.04 arm64 (it shells out to swtpm_localca, which wants certtool from
-# gnutls-bin); if it warns, check that the units still come up, which they
-# should.
+# It is best-effort: a failure here is logged and the socket is started
+# regardless. Known failure modes on 24.04 arm64 (swtpm 0.7.3), both fixed:
+#   1. "Could not create temporary directory for certs: Permission denied" —
+#      the lab user inherited a root-owned TMPDIR. common.sh chowns it.
+#   2. "swtpm_localca: Need read/write rights on statedir
+#      /var/lib/swtpm-localca" — the packaged local CA is owned by the `swtpm`
+#      system user. --create-config-files below writes a per-user config whose
+#      local CA lives under ~/.config/var/lib/swtpm-localca.
+log_info "Ensuring ${VM_USER} has a per-user swtpm_setup config (~/.config)..."
+if as_lab_user swtpm_setup --create-config-files skip-if-exist; then
+  log_ok "swtpm_setup per-user config present for ${VM_USER}"
+else
+  log_warn "could not create per-user swtpm_setup config — manufacturing below may fall back to the packaged local CA and fail; the socket does not depend on it"
+fi
+
+declare -A NEEDS_RESTART=()
 for inst in "${INSTANCES[@]}"; do
   state_dir="${STATE_ROOT}/${inst}"
   marker="${state_dir}/.lab-setup-done"
@@ -159,10 +126,10 @@ for inst in "${INSTANCES[@]}"; do
   if as_lab_user swtpm_setup --tpm2 --tpmstate "${state_dir}" \
       --createek --create-ek-cert --create-platform-cert --lock-nvram; then
     touch "${marker}"
-    chown "${LAB_USER}:${LAB_USER}" "${marker}"
+    chown "${VM_USER}:${VM_USER}" "${marker}"
     log_ok "swtpm_setup completed for '${inst}'"
   else
-    log_warn "swtpm_setup failed for '${inst}' — continuing, because --flags not-need-init,startup-clear lets swtpm create default state on its own. Only EK/platform certificates are missing, which this lab does not use."
+    log_warn "swtpm_setup failed for '${inst}' — continuing, because --flags not-need-init,startup-clear lets swtpm create default state on its own. The EK is then created on first use, without an EK certificate; enrolment does not need the certificate."
   fi
   NEEDS_RESTART[${inst}]=1
 done
@@ -178,7 +145,7 @@ log_info "Enabling and starting swtpm@device and swtpm@attacker..."
 systemctl enable --now swtpm@device swtpm@attacker
 
 # `enable --now` is a no-op for an already-running instance, so anything whose
-# unit or port file changed needs an explicit restart to pick the change up.
+# unit changed needs an explicit restart to pick the change up.
 for inst in "${INSTANCES[@]}"; do
   if (( unit_changed == 1 )) || [[ -n "${NEEDS_RESTART[${inst}]:-}" ]]; then
     log_info "Restarting swtpm@${inst} to pick up the new configuration..."
@@ -186,58 +153,11 @@ for inst in "${INSTANCES[@]}"; do
   fi
 done
 
-# --- unix bridge for Vault Enterprise TPM auth ------------------------------
-# openssl / tpm2-tools use the TCP TCTI (swtpm:port=). Vault's TPM auth and
-# vault agent only open a unix socket or a char device. socat bridges the
-# device TPM's TCP port to SWTPM_UNIX_SOCK without a second TPM.
-BRIDGE_UNIT="/etc/systemd/system/swtpm-unix-bridge.service"
-install -d -m 0755 /run/swtpm
-require_cmd socat || die "socat missing — run 'task provision'"
-
-bridge_changed=0
-if write_if_changed "${BRIDGE_UNIT}" <<EOF
-# Bridge swtpm@device TCP:${DEVICE_PORT} to ${SWTPM_UNIX_SOCK}.
-# Generated by scripts/10_tpm_unit.sh.
-[Unit]
-Description=Unix socket bridge to swtpm@device
-After=swtpm@device.service
-Requires=swtpm@device.service
-
-[Service]
-Type=simple
-ExecStartPre=/usr/bin/mkdir -p /run/swtpm
-ExecStartPre=/usr/bin/rm -f ${SWTPM_UNIX_SOCK}
-ExecStart=/usr/bin/socat UNIX-LISTEN:${SWTPM_UNIX_SOCK},fork,reuseaddr,unlink-early,mode=666 TCP:127.0.0.1:${DEVICE_PORT}
-Restart=on-failure
-RestartSec=1
-
-[Install]
-WantedBy=multi-user.target
-EOF
-then
-  bridge_changed=1
-  log_info "Wrote ${BRIDGE_UNIT}"
-fi
-
-if (( bridge_changed == 1 || unit_changed == 1 )); then
-  systemctl daemon-reload
-fi
-# Drop any hand-started socat left over from earlier experiments.
-systemctl stop swtpm-unix-bridge >/dev/null 2>&1 || true
-pkill -f "socat UNIX-LISTEN:${SWTPM_UNIX_SOCK}" >/dev/null 2>&1 || true
-rm -f "${SWTPM_UNIX_SOCK}"
-systemctl enable --now swtpm-unix-bridge
-systemctl restart swtpm-unix-bridge
-wait_for_unit swtpm-unix-bridge 15 \
-  || die "swtpm-unix-bridge did not become active"
-[[ -S "${SWTPM_UNIX_SOCK}" ]] || die "missing ${SWTPM_UNIX_SOCK} after starting the bridge"
-log_ok "Vault TPM path ${SWTPM_UNIX_SOCK} -> tcp/127.0.0.1:${DEVICE_PORT}"
-
 # --- verify ------------------------------------------------------------------
 
 log_step "Verify Part 2"
 
-# AppArmor confines swtpm on Ubuntu. State under $LAB_DIR is inside the
+# AppArmor confines swtpm on Ubuntu. State under $VM_DIR is inside the
 # profile's `owner @{HOME}/**` rule so the default policy already permits it,
 # but a customised STATE_ROOT or a tightened local profile can still trip a
 # denial. That denial never appears in the unit's own journal — only in the
@@ -258,26 +178,34 @@ for inst in "${INSTANCES[@]}"; do
   fi
 done
 
-# The unit being active only means the process is alive. This proves the TPM
-# answers commands over the TCTI the lab environment actually uses.
-wait_for "device TPM responding" 30 as_lab_user tpm2_getrandom 8 --hex \
-  || die "the device TPM did not answer on port ${DEVICE_PORT} — check 'journalctl -u swtpm@device'"
+# The unit being active only means the process is alive. This proves each TPM
+# answers commands over the socket the lab environment actually uses. env.sh
+# writes the TCTI with a :- default, so an inline override wins.
+for inst in "${INSTANCES[@]}"; do
+  sock="${INSTANCE_SOCK[${inst}]}"
+  wait_for "${inst} TPM responding on ${sock}" 30 \
+    as_lab_user env "TPM2TOOLS_TCTI=swtpm:path=${sock}" tpm2_getrandom 8 --hex \
+    || die "the ${inst} TPM did not answer on ${sock} — check 'journalctl -u swtpm@${inst}'"
+done
 
-# Same check against the attacker TPM, which Part 8.1 depends on. env.sh writes
-# its TCTI with a :- default, so an inline override wins.
-wait_for "attacker TPM responding" 30 \
-  as_lab_user env "TPM2TOOLS_TCTI=swtpm:port=${ATTACKER_PORT}" tpm2_getrandom 8 --hex \
-  || die "the attacker TPM did not answer on port ${ATTACKER_PORT} — check 'journalctl -u swtpm@attacker'"
-
-log_info "tpm2_getrandom 8 --hex:"
+log_info "tpm2_getrandom 8 --hex (device TPM):"
 log_detail "  $(as_lab_user tpm2_getrandom 8 --hex)"
 
 log_info "TPM2_PT_MANUFACTURER:"
 as_lab_user tpm2_getcap properties-fixed | grep -A2 TPM2_PT_MANUFACTURER | sed 's/^/  /' \
   || log_warn "TPM2_PT_MANUFACTURER not found in tpm2_getcap properties-fixed"
 
-log_info "openssl providers:"
-as_lab_user openssl list -providers -provider tpm2 -provider default | sed 's/^/  /' \
-  || log_warn "the tpm2 OpenSSL provider did not load — check that tpm2-openssl is installed"
+# The endorsement key is what Vault will register. Two TPMs, two EKs, two IDs:
+# the contrast is what the Part 8 demos rest on.
+if command -v vault >/dev/null 2>&1; then
+  log_info "Endorsement key IDs, as the Vault CLI computes them (sha256 of the EK public key):"
+  for inst in "${INSTANCES[@]}"; do
+    sock="${INSTANCE_SOCK[${inst}]}"
+    flush_tpm_contexts "${sock}"
+    tpm_id="$(as_lab_user_allow_fail vault tpm ek -tpm-device-path="${sock}" -format=json 2>/dev/null \
+      | jq -r '.tpm_id // empty' || true)"
+    log_detail "  ${inst}: ${tpm_id:-(could not read the EK)}"
+  done
+fi
 
-log_ok "Part 2 complete: device TPM on ${DEVICE_PORT}, attacker TPM on ${ATTACKER_PORT} — next: task vault"
+log_ok "Part 2 complete: device TPM at ${TPM_SOCK}, attacker TPM at ${ATTACKER_TPM_SOCK} — next: task vault"

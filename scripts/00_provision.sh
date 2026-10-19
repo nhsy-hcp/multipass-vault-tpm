@@ -4,16 +4,31 @@ STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${STAGE_DIR}/common.sh"
 
-# Part 1: install the TPM tooling and Vault, and lay out the lab directory.
+# Part 1: install the TPM tooling and Vault Enterprise, and lay out the lab
+# directory.
 #
 # Runs as root inside the VM via `sudo -E bash <stage>/00_provision.sh`.
 # Everything here is idempotent: re-running on a provisioned VM should touch
 # apt at most once and finish in seconds.
+#
+# Vault Enterprise comes from the HashiCorp apt repository, pinned to the
+# version passed as $1 (VAULT_VERSION in the Taskfile) and held there. The
+# licence is not packaged: `task provision` stages it from VAULT_LICENSE in
+# the host's .env, as a systemd EnvironmentFile, before this script runs.
 
-log_step "Part 1: install TPM tooling and Vault"
+VAULT_VERSION="${1:?usage: 00_provision.sh <vault-enterprise apt version, e.g. 2.2.0+ent-1>}"
+
+log_step "Part 1: install TPM tooling and Vault Enterprise"
 
 # Non-interactive or dpkg will block on service-restart prompts under `multipass exec`.
 export DEBIAN_FRONTEND=noninteractive
+
+KEYRING="/usr/share/keyrings/hashicorp-archive-keyring.gpg"
+HASHICORP_LIST="/etc/apt/sources.list.d/hashicorp.list"
+VAULT_PKG="vault-enterprise"
+VAULT_INSTALLED="/usr/bin/vault"
+LICENCE_STAGED="${STAGE_DIR}/licence/vault-dev.env"
+LICENCE_INSTALLED="/etc/vault-dev.env"
 
 # --- apt helpers -------------------------------------------------------------
 
@@ -49,8 +64,8 @@ apt_install() {
 
 log_info "Checking base packages..."
 BASE_PACKAGES=(
-  swtpm swtpm-tools tpm2-tools tpm2-openssl
-  jq tmux gpg wget unzip socat lsb-release ca-certificates
+  swtpm swtpm-tools tpm2-tools
+  jq tmux ca-certificates curl gnupg lsb-release
 )
 
 missing=()
@@ -84,102 +99,72 @@ else
   apt_install "${tcti_pkg}"
 fi
 
-# --- 1.2 Vault Enterprise (TPM auth) -----------------------------------------
-#
-# This lab needs the Vault Enterprise TPM auth method and the matching Proxy
-# auto-auth. Those are not in the OSS apt package. Pin a release zip from
-# releases.hashicorp.com and install the binary at /usr/local/bin/vault so it
-# wins over any leftover /usr/bin/vault from an earlier apt install.
-
-VAULT_VERSION="${VAULT_VERSION:-2.2.0+ent}"
-VAULT_INSTALL_DIR="/usr/local/bin"
-VAULT_BIN="${VAULT_INSTALL_DIR}/vault"
+# --- 1.2 Vault Enterprise ----------------------------------------------------
 
 log_step "Vault Enterprise ${VAULT_VERSION}"
 
-require_cmd wget unzip sha256sum dpkg \
-  || die "the base package install did not provide the tools needed to install Vault"
-
-# Prefer the zip's linux_<arch> name. dpkg reports arm64; releases use arm64 too.
-arch="$(dpkg --print-architecture)"
-case "${arch}" in
-  amd64|arm64|386|ppc64le|s390x) ;;
-  *) die "no Vault Enterprise zip for architecture '${arch}'" ;;
-esac
-
-vault_zip="vault_${VAULT_VERSION}_linux_${arch}.zip"
-vault_base_url="https://releases.hashicorp.com/vault/${VAULT_VERSION}"
-vault_zip_url="${vault_base_url}/${vault_zip}"
-vault_sums_url="${vault_base_url}/vault_${VAULT_VERSION}_SHA256SUMS"
-
-need_vault_install=1
-if [[ -x "${VAULT_BIN}" ]]; then
-  installed="$(${VAULT_BIN} version 2>/dev/null || true)"
-  # vault version prints "Vault v2.2.0+ent (...)" — match the version token.
-  if printf '%s' "${installed}" | grep -Fq "v${VAULT_VERSION}"; then
-    need_vault_install=0
-    log_detected "Vault ${VAULT_VERSION} already at ${VAULT_BIN}" "skipping download"
-  else
-    log_detected "a different Vault at ${VAULT_BIN}" "${installed:-unknown} — replacing it"
-  fi
+# The HashiCorp repository, signed by its own keyring rather than trusted
+# globally. Written only when absent, so a re-run does not force an apt update.
+if [[ ! -s "${KEYRING}" || ! -f "${HASHICORP_LIST}" ]]; then
+  log_detected "no HashiCorp apt repository" "adding it"
+  curl -fsSL https://apt.releases.hashicorp.com/gpg | gpg --dearmor --yes -o "${KEYRING}"
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=${KEYRING}] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+    > "${HASHICORP_LIST}"
+  APT_UPDATED=0
+else
+  log_detected "the HashiCorp apt repository" "already configured"
 fi
 
-if (( need_vault_install == 1 )); then
-  # Stop anything still holding the old binary before we overwrite it.
-  systemctl stop vault-dev vault-proxy@payments vault-proxy@analytics \
-    vault.service 2>/dev/null || true
+installed_ver="$(dpkg-query -W -f='${Version}' "${VAULT_PKG}" 2>/dev/null || true)"
+if [[ "${installed_ver}" == "${VAULT_VERSION}" ]] && pkg_installed "${VAULT_PKG}"; then
+  log_detected "${VAULT_PKG} ${installed_ver}" "skipping the install"
+else
+  log_detected "${VAULT_PKG} ${installed_ver:-not installed}" "installing ${VAULT_VERSION}"
+  apt_update_once
+  apt-mark unhold "${VAULT_PKG}" >/dev/null 2>&1 || true
+  apt_install --allow-downgrades "${VAULT_PKG}=${VAULT_VERSION}"
+fi
+# Held so an unattended `apt upgrade` cannot move the lab off the pinned build.
+apt-mark hold "${VAULT_PKG}" >/dev/null
+log_ok "${VAULT_PKG} held at ${VAULT_VERSION}"
 
-  work="$(mktemp -d)"
-  cleanup_vault_work() { rm -rf "${work}"; }
-  trap cleanup_vault_work EXIT
-
-  log_info "Downloading ${vault_zip_url}"
-  wget -q -O "${work}/${vault_zip}" "${vault_zip_url}"
-  wget -q -O "${work}/SHA256SUMS" "${vault_sums_url}"
-
-  log_info "Verifying SHA-256"
-  (
-    cd "${work}"
-    grep -F " ${vault_zip}" SHA256SUMS | sha256sum -c -
-  )
-
-  log_info "Installing vault to ${VAULT_BIN}"
-  unzip -qo "${work}/${vault_zip}" -d "${work}"
-  install -m 0755 "${work}/vault" "${VAULT_BIN}"
-
-  # An apt-installed vault at /usr/bin/vault would otherwise shadow this one
-  # when PATH puts /usr/bin first. Remove the packages; the binary we want is
-  # the one under /usr/local/bin.
-  if pkg_installed vault || pkg_installed vault-enterprise; then
-    log_detected "apt vault package(s)" "removing so ${VAULT_BIN} is the only vault"
-    apt-get remove -y -qq vault vault-enterprise 2>/dev/null || true
-  fi
-
-  cleanup_vault_work
-  trap - EXIT
+# The package ships vault.service for a production server, which would bind
+# 127.0.0.1:8200 and fight vault-dev for the port. The lab never uses it.
+if systemctl is-enabled --quiet vault.service 2>/dev/null \
+  || systemctl is-active --quiet vault.service 2>/dev/null; then
+  log_detected "the packaged vault.service enabled or running" "disabling it"
+  systemctl disable --now vault.service
 fi
 
-# Ensure /usr/local/bin is ahead of /usr/bin for non-login shells that
-# multipass and systemd ExecStart use. The unit files call /usr/bin/vault
-# today; point them at the Enterprise binary via a symlink if needed.
-if [[ ! -e /usr/bin/vault ]] || [[ "$(readlink -f /usr/bin/vault 2>/dev/null || true)" != "$(readlink -f "${VAULT_BIN}")" ]]; then
-  if [[ -e /usr/bin/vault && ! -L /usr/bin/vault ]]; then
-    log_warn "/usr/bin/vault is a real file, not a symlink — leaving it; units use ${VAULT_BIN}"
-  else
-    ln -sfn "${VAULT_BIN}" /usr/bin/vault
-    log_ok "/usr/bin/vault -> ${VAULT_BIN}"
-  fi
-fi
-
-[[ -x "${VAULT_BIN}" ]] || die "Vault binary missing at ${VAULT_BIN} after install"
-log_ok "$(${VAULT_BIN} version)"
+vault_ver="$("${VAULT_INSTALLED}" version 2>&1)" \
+  || die "${VAULT_INSTALLED} does not run: ${vault_ver}"
+[[ "${vault_ver}" == *"+ent"* ]] \
+  || die "${VAULT_INSTALLED} is not an Enterprise build: ${vault_ver}"
+log_ok "${vault_ver}"
 
 # --- 1.3 Lab directory and environment file ----------------------------------
 
 log_step "Lab directory and environment file"
 
-lab_mkdir "${LAB_DIR}" "${LAB_STATE_DIR}" "${LAB_TLS_DIR}" "${LAB_PKI_DIR}" "${LAB_DIR}/logs"
-log_ok "lab tree under ${LAB_DIR}"
+lab_mkdir "${VM_DIR}" "${STATE_DIR}" "${TLS_DIR}" "${TPM_DIR}" "${VM_DIR}/logs"
+log_ok "lab tree under ${VM_DIR}"
+
+# Enterprise licence as VAULT_LICENSE=<text>, the vault-dev unit's
+# EnvironmentFile. Root-only: systemd reads it before dropping to the lab user,
+# so the server gets the licence and the lab shell cannot read it.
+if [[ -s "${LICENCE_STAGED}" ]]; then
+  if [[ -f "${LICENCE_INSTALLED}" ]] && cmp -s "${LICENCE_STAGED}" "${LICENCE_INSTALLED}"; then
+    log_detected "unchanged ${LICENCE_INSTALLED}" "skipping the install"
+  else
+    install -m 0600 -o root -g root "${LICENCE_STAGED}" "${LICENCE_INSTALLED}"
+    log_ok "installed licence at ${LICENCE_INSTALLED}"
+  fi
+  rm -rf "$(dirname "${LICENCE_STAGED}")"
+elif [[ -s "${LICENCE_INSTALLED}" ]]; then
+  log_detected "existing licence at ${LICENCE_INSTALLED}" "keeping it"
+else
+  log_warn "no licence staged or installed — Vault Enterprise will not start; paste the licence text into VAULT_LICENSE in the host's .env and re-run 'task provision'"
+fi
 
 # One environment file, sourced by interactive shells and by as_lab_user()
 # alike, so an automated step and a live demo shell behave identically.
@@ -189,49 +174,53 @@ log_ok "lab tree under ${LAB_DIR}"
 # stay on the host — only scripts/ and lib/common.sh are transferred into the VM.
 #
 # The \$ escapes keep the :- defaults literal in the written file, so a caller
-# can override TPM2TOOLS_TCTI to aim at the attacker TPM (port ${ATTACKER_TPM_PORT}).
-if write_if_changed "${LAB_DIR}/env.sh" <<EOF
-# Lab environment for the Vault TPM cert-auth lab.
+# can override the TPM path to aim at the attacker TPM.
+if write_if_changed "${VM_DIR}/env.sh" <<EOF
+# Lab environment for the Vault TPM auth lab.
 # Generated by scripts/00_provision.sh — edit templates/lab-env.sh.tpl and the
 # heredoc in that script, not this file.
 
-export LAB_DIR="${LAB_DIR}"
+export VM_DIR="${VM_DIR}"
+export TPM_DIR="${TPM_DIR}"
 
-# TPM connection. The software TPM speaks TCP, so the TCTI names a port rather
-# than /dev/tpmrm0 — on real hardware this is the only line that changes.
+# TPM connection. Each software TPM serves a unix socket, and tpm2-tools and
+# the Vault CLI reach the same TPM through the same path. On real hardware this
+# becomes /dev/tpmrm0 (TCTI "device:/dev/tpmrm0") and nothing else changes.
 #
-# Both are written with a :- default so a caller can point a single command at
-# the attacker TPM without editing this file:
-#   TPM2TOOLS_TCTI=swtpm:port=${ATTACKER_TPM_PORT} tpm2_getrandom 8 --hex
-# That is how the Part 8.1 stolen-key demo simulates a different machine.
-export TPM2TOOLS_TCTI="\${TPM2TOOLS_TCTI:-swtpm:port=${TPM_PORT}}"
-export TPM2OPENSSL_TCTI="\${TPM2OPENSSL_TCTI:-swtpm:port=${TPM_PORT}}"
+# Written with :- defaults so a caller can point one command at the attacker
+# TPM without editing this file — that is how the Part 8 demos simulate a
+# different machine:
+#   vault tpm ek -tpm-device-path=\${ATTACKER_TPM_DEVICE_PATH}
+#   TPM2TOOLS_TCTI=swtpm:path=\${ATTACKER_TPM_DEVICE_PATH} tpm2_getrandom 8 --hex
+export TPM_DEVICE_PATH="\${TPM_DEVICE_PATH:-${TPM_SOCK}}"
+export TPM2TOOLS_TCTI="\${TPM2TOOLS_TCTI:-swtpm:path=${TPM_SOCK}}"
+export ATTACKER_TPM_DEVICE_PATH="${ATTACKER_TPM_SOCK}"
 
 # Vault dev server with TLS. The dev certificate is issued for 127.0.0.1 only,
 # which is why client and server both live inside the VM.
 export VAULT_ADDR="https://127.0.0.1:8200"
-export VAULT_CACERT="${LAB_TLS_DIR}/vault-ca.pem"
+export VAULT_CACERT="${TLS_DIR}/vault-ca.pem"
 export VAULT_TOKEN="root"
 EOF
 then
-  log_info "Wrote ${LAB_DIR}/env.sh"
+  log_info "Wrote ${VM_DIR}/env.sh"
 else
-  log_detected "unchanged ${LAB_DIR}/env.sh" "leaving it alone"
+  log_detected "unchanged ${VM_DIR}/env.sh" "leaving it alone"
 fi
 # write_if_changed installs as root; the lab user must be able to source it.
-chown "${LAB_USER}:${LAB_USER}" "${LAB_DIR}/env.sh"
-chmod 0644 "${LAB_DIR}/env.sh"
-log_ok "${LAB_DIR}/env.sh owned by ${LAB_USER}, mode 0644"
+chown "${VM_USER}:${VM_USER}" "${VM_DIR}/env.sh"
+chmod 0644 "${VM_DIR}/env.sh"
+log_ok "${VM_DIR}/env.sh owned by ${VM_USER}, mode 0644"
 
 # --- Verify ------------------------------------------------------------------
 
 log_step "Verify Part 1"
 
-require_cmd swtpm swtpm_setup tpm2_getrandom tpm2_getcap openssl vault jq \
+require_cmd swtpm swtpm_setup tpm2_getrandom tpm2_getcap tpm2_flushcontext tpm2_print openssl vault jq \
   || die "provisioning left a required command missing — see the errors above"
 
-log_info "vault version:"
-log_detail "  $(vault version)"
+log_info "vault on PATH (expect ${VAULT_INSTALLED}):"
+log_detail "  $(command -v vault) — $(vault version)"
 
 # `-v` only prints the tool banner, but it still loads the TCTI library, so a
 # failure here usually means the TCTI package resolved above is not usable.

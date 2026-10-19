@@ -1,15 +1,24 @@
-# Vault TPM Authentication Lab
+# Vault TPM Auth Lab
 
-A Vault Enterprise lab on an Ubuntu VM. You configure TPM auth yourself, log in
-with a TPM-backed application key, then put one workload behind an owner-only
-Unix socket whose agent logs in as that same role.
+A self-contained lab that shows a machine authenticating to HashiCorp Vault with
+**Vault Enterprise's `tpm` auth method**: the device is identified by its TPM's
+endorsement key, it proves possession of that key through an EK/AK attestation, Vault's
+internal CA issues it a client certificate, and every login is an mTLS handshake signed
+inside the TPM by a key that can never be exported. The device holds no Vault token to
+enrol — the silicon is the credential. The lab's negative tests prove it: the same key
+blobs against a different TPM fail the integrity check before the handshake even starts,
+and a TPM Vault has not registered cannot begin attestation at all.
+
+**This lab is for Vault Enterprise only.** The `tpm` auth method is an Enterprise
+feature: the lab installs the GA Vault Enterprise package from HashiCorp's apt repository
+inside the VM, and you supply the licence.
+
+![Topology](docs/diagrams/topology.png)
 
 ## Prerequisites
 
-Everything runs on a macOS host driving an Ubuntu 24.04 VM via Multipass.
-
-Vault TPM authentication requires Vault Enterprise `2.2.0+ent`. Put the Enterprise
-licence at `.vault-license` before `task provision-demo`.
+Everything runs on a macOS host driving an Ubuntu 24.04 VM via Multipass (arm64 on Apple
+Silicon, amd64 on Intel — both work).
 
 | Tool | Why |
 |---|---|
@@ -17,131 +26,42 @@ licence at `.vault-license` before `task provision-demo`.
 | `task` ([go-task](https://taskfile.dev)) | runs everything — required |
 | `jq` | parses Vault JSON — required |
 | `git` | required |
-| `graphviz`, `librsvg` | optional — only to re-render diagrams with `task docs:diagram` |
+| `graphviz` | optional — only to re-render the diagrams with `task docs:diagram` |
 | `shellcheck`, `gitleaks`, `pre-commit` | optional — only for `task lint` |
 
 ```bash
 brew install --cask multipass
-brew install go-task jq graphviz librsvg shellcheck gitleaks pre-commit
+brew install go-task jq graphviz shellcheck gitleaks pre-commit
 ```
 
-## Walkthrough
+One file that is **not** in this repository and never will be:
 
-`task provision-demo` launches the VM, installs the TPM tooling and Vault, and
-starts the software TPM and the Vault dev server. It does not enable auth
-methods, write policies, or enrol a device.
+| File | What it is |
+|---|---|
+| A Vault Enterprise licence | Its text pasted into `.env` as `VAULT_LICENSE` on one line (`task init` seeds `.env` from `.env.template`); `.env` is gitignored |
 
-Commands marked **on device** have to run where the TPM is. In this lab that is
-the VM. Commands marked **anywhere** only talk to Vault.
+`task provision` pushes the licence into the VM, skipping the copy on later runs when the
+installed copy already matches, and installs `vault-enterprise` from HashiCorp's apt
+repository at the version pinned by `VAULT_VERSION` (default `2.2.0+ent-1`, overridable
+in `.env`), holding it there so an `apt upgrade` cannot move it.
 
-### Prepare the VM
-
-On the host:
+## Quick start
 
 ```bash
-task provision-demo
-task shell
+task deps    # verify host tooling and that VAULT_LICENSE is set in .env
+task init    # one-time project setup (pre-commit hooks, .env)
+task all     # launch the VM, provision it, start the TPMs and Vault, enrol node01
+task demo    # the narrated walkthrough, every negative test, and the Vault Agent
 ```
 
-In the VM:
+`task all` takes a few minutes on first run; each of its steps is idempotent and
+individually re-runnable.
 
-```bash
-source ~/lab/env.sh
-```
-
-`~/lab/env.sh` sets `VAULT_ADDR`, `VAULT_CACERT`, and `VAULT_TOKEN=root`.
-
-### Secret and policy
-
-```bash
-vault kv put secret/devices/node01 \
-  message="hello from vault, attested by TPM key"
-
-vault policy write device-read - <<'EOF'
-path "secret/data/devices/*" {
-  capabilities = ["read"]
-}
-EOF
-```
-
-### Enable TPM auth and enrol this TPM
-
-Anywhere — enable the method:
-
-```bash
-vault auth enable tpm
-vault write auth/tpm/config default_cert_ttl=2160h
-```
-
-On device — enrol the endorsement key:
-
-```bash
-vault tpm enroll \
-  -name=node01 \
-  -tpm-device-path=/run/swtpm/device.sock \
-  -metadata=lab=tpm-lab
-
-tpm_id=$(vault tpm ek -tpm-device-path=/run/swtpm/device.sock -format=json | jq -r .tpm_id)
-```
-
-Anywhere — bind a role to that TPM id:
-
-```bash
-vault write auth/tpm/role/machine-cli \
-  tpm_ids="$tpm_id" \
-  token_policies=device-read \
-  token_ttl=15m \
-  token_max_ttl=1h
-```
-
-### Attest and log in
-
-On device. Attest creates the application key for this role. `unset` drops the
-root token from the shell so the login is the TPM method.
-
-```bash
-unset VAULT_TOKEN
-mkdir -p ~/lab/cli-tpm
-
-vault tpm attest \
-  -role-name=machine-cli \
-  -tpm-device-path=/run/swtpm/device.sock \
-  -tpm-state-dir="$HOME/lab/cli-tpm" \
-  -cert-subject-CN=node01.devices.lab.local
-
-vault login -method=tpm -no-store \
-  -tpm-state-dir="$HOME/lab/cli-tpm" \
-  -tpm-device-path=/run/swtpm/device.sock \
-  role_name=machine-cli
-
-token=$(env -u VAULT_TOKEN vault login -method=tpm -no-store -field=token \
-  -tpm-state-dir="$HOME/lab/cli-tpm" \
-  -tpm-device-path=/run/swtpm/device.sock \
-  role_name=machine-cli)
-
-VAULT_TOKEN="$token" vault kv get secret/devices/node01
-```
-
-### Socket proxy
-
-Leave the VM shell. On the host, `task proxy:socket` creates the `payments`
-user and starts one Vault Agent on `/run/vault-proxy/payments.sock`. The agent
-attests as `machine-cli` and forces that token onto the socket.
-
-```bash
-task proxy:socket
-task shell
-```
-
-In the VM, the workload does not use a Vault token of its own. Only `payments`
-can open the socket:
-
-```bash
-echo $VAULT_TOKEN
-sudo -u payments env \
-  VAULT_ADDR=unix:///run/vault-proxy/payments.sock \
-  vault kv get secret/devices/node01
-```
+`task demo` pauses between parts so there is room to narrate, printing each Vault
+command as it runs; press ⏎ to go on, `q` to stop and be told how to resume.
+`PAUSE=0 task demo` runs it straight through in under a minute. `.env` (seeded by
+`task init`) can override that, the VM name, the device name and domain, the Vault
+version, and holds the licence.
 
 ## All tasks
 
@@ -149,19 +69,25 @@ sudo -u payments env \
 task --list
 ```
 
-That is the authoritative catalogue. `task shell` opens the VM.
-`task logs:tpm` and `task logs:vault` follow the software TPM and Vault journals.
+That is the authoritative catalogue — build steps, individual demo segments,
+`task shell`, and `task logs:tpm` / `task logs:vault` / `task logs:agent` for the
+systemd units.
 
-[`docs/architecture.md`](docs/architecture.md) covers the topology, what the TPM
-does and does not guarantee, and how the lab maps onto a production deployment.
+## Documentation
+
+[`docs/architecture.md`](docs/architecture.md) covers the topology, the enrolment and
+login trust chain, what the TPM does and does not guarantee, the Vault Agent doing the
+same login unattended, what was learned by running Vault 2.2.0, a task-by-task
+walkthrough, troubleshooting, and how the lab maps onto a production deployment.
 
 ## Reset and cleanup
 
 ```bash
-task reset   # wipe lab state inside the VM, keep the VM
+task reset   # wipe lab state inside the VM (including both TPMs' seeds), keep the VM
 task clean   # delete and purge the VM entirely
 task rebuild # clean, then rebuild the whole lab from scratch
 ```
 
 All lab state — keys, certificates, Vault configuration — lives inside the VM. The host
-holds nothing but this source tree.
+holds nothing but this source tree and the gitignored `.env`, whose only secret is the
+licence.

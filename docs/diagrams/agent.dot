@@ -1,0 +1,157 @@
+// Vault TPM auth lab — Part 9: the Vault Agent doing the device's work.
+// Render: dot -Tpng -Gdpi=144 -o agent.png agent.dot
+// or: task docs:diagram
+
+digraph agent {
+  rankdir=TB;
+  bgcolor="white";
+  compound=true;
+  splines=spline;
+  nodesep=0.45;
+  ranksep=0.65;
+  fontname="Helvetica";
+  fontsize=12;
+  fontcolor="#1a202c";
+  pad=0.35;
+  label="Vault Agent — the device's half of enrolment and all of login, unattended.\nThe orchestrator's half is not automated away: the agent never registers its own endorsement key.";
+  labelloc="t";
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=10,
+    color="#4a5568",
+    fillcolor="#f7fafc",
+    fontcolor="#1a202c",
+    penwidth=1.1,
+    margin="0.18,0.10"
+  ];
+
+  edge [
+    fontname="Helvetica",
+    fontsize=10,
+    color="#4a5568",
+    fontcolor="#2d3748",
+    penwidth=1.0,
+    arrowsize=0.7
+  ];
+
+  // Out of band, once per device, and not the agent's to do.
+  subgraph cluster_orchestrator {
+    label="Orchestrator — once, before the agent ever runs";
+    labeljust="l";
+    fontsize=11;
+    fontcolor="#1a202c";
+    margin=14;
+    style="rounded,filled";
+    fillcolor="#f2f2f0";
+    color="#6b6b64";
+    penwidth=1.2;
+
+    orch [
+      label="task enrol\nscoped 'enrol-orchestrator' token",
+      fillcolor="#fdf0da",
+      color="#b5883f"
+    ];
+  }
+
+  // The two halves of the agent's own configuration, each folded into the
+  // component it configures — the split is the lesson of Part 9.
+  subgraph cluster_agent {
+    label="vault-agent.service — installed disabled, started only after the enrolment gate";
+    labeljust="l";
+    fontsize=11;
+    fontcolor="#1a202c";
+    margin=14;
+    style="rounded,filled";
+    fillcolor="#fdf7ec";
+    color="#b5883f";
+    penwidth=1.2;
+
+    certmgr [
+      label="tpm_cert \"node01\"  →  tpmattest manager\nGETS AND KEEPS the certificate\nrole_name · mount_path · tpm { device_path }\ndestination { path } · renew { min_validity_percentage }",
+      fillcolor="#fdf0da",
+      color="#b5883f"
+    ];
+
+    authh [
+      label="auto_auth method \"tpm\"  →  auth handler\nUSES that certificate to log in\nconfig = { tpm_cert = \"node01\" }",
+      fillcolor="#fdf0da",
+      color="#b5883f"
+    ];
+
+    sink [label="file sink\n~/lab/agent/token"];
+    tmpl [label="template server\n~/lab/agent/message.txt"];
+  }
+
+  tpm [
+    label="swtpm@device\n~/lab/tpmstate/device/swtpm.sock\n(/dev/tpmrm0 in production)",
+    fillcolor="#dcedd9",
+    color="#5f8a57"
+  ];
+
+  state [
+    label="~/lab/tpm/agent/  — its own, not the device's\nclient.crt · ca_chain.pem\napp.blob · ak.blob · client-key.json",
+    shape=note,
+    style="filled",
+    fillcolor="#dcedd9",
+    color="#5f8a57"
+  ];
+
+  vault [
+    label="vault-dev\nauth/tpm + its internal CA\nidentity/tpm · identity/tpmgroup\nsecret/devices/node01",
+    fillcolor="#ece0f2",
+    color="#7d5b92"
+  ];
+
+  // ------------------------------------------------------------------- the flow
+  orch -> vault [
+    label="  1. register the EK, admit it\n  to the 'devices' group",
+    style=dashed,
+    color="#b5883f",
+    fontcolor="#8a6428"
+  ];
+
+  certmgr -> tpm [
+    label="  2. create the AK and application\n  key, sealed to this TPM",
+    color="#5f8a57",
+    fontcolor="#3f5f39"
+  ];
+
+  certmgr -> vault [
+    label="3. gentpmcert/begin + finish —\nno Vault token, the EK is the credential",
+    color="#7d5b92",
+    fontcolor="#5a3f6b"
+  ];
+
+  certmgr -> state [
+    label="  4. persists the blobs\n  and the certificate",
+    color="#5f8a57",
+    fontcolor="#3f5f39"
+  ];
+
+  certmgr -> authh [label="  5. the certificate it keeps"];
+
+  authh -> vault [
+    label="  6. auth/tpm/login over mTLS,\l  the handshake signed inside the TPM\l",
+    color="#7d5b92",
+    fontcolor="#5a3f6b"
+  ];
+
+  authh -> sink [label="  7. token, 0600"];
+  sink  -> tmpl [label="  8. the template server uses it", style=dotted];
+
+  tmpl -> vault [
+    label="9. read secret/data/devices/node01\nand render it to disk",
+    color="#7d5b92",
+    fontcolor="#5a3f6b"
+  ];
+
+  certmgr:w -> certmgr:w [
+    label="10. renewal timer —\nre-attest before the\ncertificate expires  ",
+    style=dotted,
+    color="#5f8a57",
+    fontcolor="#3f5f39"
+  ];
+}
