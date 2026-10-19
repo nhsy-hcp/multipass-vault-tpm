@@ -145,6 +145,17 @@ tasks:
       - echo ""
       - echo "Lab ready. Run 'task demo' for the full walkthrough."
 
+  demo:prepare:
+    aliases: [provision-demo]
+    desc: Build the VM, TPMs and Vault, and stop before configuration — for a live demo of Parts 4-6
+    cmds:
+      - task: launch
+      - task: provision
+      - task: tpm
+      - task: vault
+      - echo ""
+      - echo "Infrastructure ready. Configure and enrol by hand from Part 4, or run 'task config enrol'."
+
   provision:
     desc: 'Part 1: install TPM tooling and Vault Enterprise in the VM'
     preconditions:

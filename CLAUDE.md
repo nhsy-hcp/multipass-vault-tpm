@@ -34,7 +34,7 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 
 | Task | Purpose |
 |---|---|
-| `deps` | Check host dependencies (multipass, task, jq, git; optional graphviz, shellcheck, gitleaks, pre-commit) and that `VAULT_LICENSE` is non-empty (reported without printing it) |
+| `deps` | Check host dependencies (multipass, task, jq, git; optional graphviz, librsvg, shellcheck, gitleaks, pre-commit) and that `VAULT_LICENSE` is non-empty (reported without printing it) |
 | `init` | One-time setup — install pre-commit hooks, seed `.env` |
 
 **VM lifecycle**
@@ -53,6 +53,7 @@ Run `task --list` for the authoritative version. Grouped by purpose:
 | Task | Purpose |
 |---|---|
 | `all` | launch → provision → tpm → vault → config → enrol |
+| `demo:prepare` (`provision-demo`) | launch → provision → tpm → vault, then stop — for configuring and enrolling by hand from Part 4 in a live demo |
 | `provision` | Part 1: install and hold `vault-enterprise` at `VAULT_VERSION` from HashiCorp's apt repo, push the licence, install TPM tooling |
 | `tpm` | Part 2: start both software TPMs as systemd units, each on a unix socket |
 | `vault` | Part 3: start the Vault dev server (TLS, licensed) as a systemd unit |

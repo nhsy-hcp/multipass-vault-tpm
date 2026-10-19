@@ -14,7 +14,7 @@ log_step "Host dependencies"
 
 missing=0
 required=(multipass task jq git)
-optional=(shellcheck gitleaks pre-commit dot)
+optional=(shellcheck gitleaks pre-commit dot rsvg-convert)
 
 for c in "${required[@]}"; do
   if command -v "$c" >/dev/null 2>&1; then
@@ -31,6 +31,7 @@ for c in "${optional[@]}"; do
   else
     case "$c" in
       dot)  log_warn "graphviz not installed — 'task docs:diagram' will fail. Install: brew install graphviz" ;;
+      rsvg-convert) log_warn "librsvg not installed — 'task docs:diagram' will fail. Install: brew install librsvg" ;;
       *)    log_warn "$c not installed — 'task lint' will fail. Install: brew install $c" ;;
     esac
   fi

@@ -670,6 +670,7 @@ stolen-key test never requires stopping and restarting the real one.
 | `task config` | Enables tpm auth and configures its CA (clearing any certificates from a previous CA), writes the KV secret and the `device-read` policy, creates the `devices` group and role, writes the `enrol-orchestrator` policy and mints its token | Re-runnable; this is the step to repeat after a Vault restart. Uses the root token, correctly |
 | `task enrol` | Reads the EK, registers it and admits it to the group as the orchestrator, attests as the device with no token, verifies the certificate's SAN | A certificate naming the TPM ID and role; re-runs skip attestation while the certificate is fresh |
 | `task all` | All of the above in order | Ends with "Lab ready" |
+| `task demo:prepare` (`provision-demo`) | `launch`, `provision`, `tpm` and `vault`, then stops | For a live demo that configures and enrols by hand from Part 4; `task config enrol` picks up from there |
 | `task demo:nonexportable` | Shows the blob structure, the failed `openssl` load, the `fixedtpm` attributes and the matching public key | The talking point that lands hardest |
 | `task demo:login` | The mTLS login | A client token with policies `default` and `device-read`, and metadata naming the TPM |
 | `task demo:privilege` | Read then write with the device token | Read succeeds, write is denied |

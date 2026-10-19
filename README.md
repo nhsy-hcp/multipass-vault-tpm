@@ -26,12 +26,12 @@ Silicon, amd64 on Intel — both work).
 | `task` ([go-task](https://taskfile.dev)) | runs everything — required |
 | `jq` | parses Vault JSON — required |
 | `git` | required |
-| `graphviz` | optional — only to re-render the diagrams with `task docs:diagram` |
+| `graphviz`, `librsvg` | optional — only to re-render the diagrams with `task docs:diagram` |
 | `shellcheck`, `gitleaks`, `pre-commit` | optional — only for `task lint` |
 
 ```bash
 brew install --cask multipass
-brew install go-task jq graphviz shellcheck gitleaks pre-commit
+brew install go-task jq graphviz librsvg shellcheck gitleaks pre-commit
 ```
 
 One file that is **not** in this repository and never will be:
@@ -55,7 +55,8 @@ task demo    # the narrated walkthrough, every negative test, the Vault Agent an
 ```
 
 `task all` takes a few minutes on first run; each of its steps is idempotent and
-individually re-runnable.
+individually re-runnable. To configure and enrol by hand in front of an audience,
+`task demo:prepare` builds the VM, TPMs and Vault and stops before Part 4.
 
 `task demo` pauses between parts so there is room to narrate, printing each Vault
 command as it runs; press ⏎ to go on, `q` to stop and be told how to resume.

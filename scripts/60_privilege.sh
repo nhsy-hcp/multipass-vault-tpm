@@ -117,3 +117,8 @@ fi
 
 log_info ""
 log_ok "the same identity that proved itself with the TPM key is still only allowed what the policy says: read this secret, nothing more"
+log_info ""
+log_detail "Here the script carried the token from Part 7 to each call itself: kept out of"
+log_detail "the source, but still the workload's to hold, renew and protect. Parts 9-11"
+log_detail "hand that to Vault Agent, which attests, logs in, renews and — as a proxy —"
+log_detail "applies the token for the workload, which then never holds one at all."
